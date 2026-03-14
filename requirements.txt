@@ -1,0 +1,10 @@
+python-telegram-bot==21.*
+python-dotenv
+toml
+fastapi
+uvicorn
+psutil
+GPUtil
+pyperclip
+mss
+httpx
