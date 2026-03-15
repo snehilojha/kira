@@ -7,5 +7,5 @@ venv/
 *.egg-info/
 dist/
 build/
-/config
 telegram_runner_spec.md
+config

@@ -1,4 +1,4 @@
-# telegram-runner
+# kira
 
 A persistent background service running on your Windows PC that accepts commands from your phone via Telegram, executes Python scripts and shell commands, streams output in real time, and proactively notifies you of events.
 
@@ -7,7 +7,7 @@ A persistent background service running on your Windows PC that accepts commands
 ### 1. Install dependencies
 
 ```bash
-cd telegram-runner
+cd kira
 pip install -r requirements.txt
 ```
 

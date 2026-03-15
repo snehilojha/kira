@@ -962,8 +962,9 @@ async def handle_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/help`` — list all commands and script aliases."""
     aliases = ", ".join(_SCRIPTS_CONFIG.keys()) or "(none configured)"
+    alias_lines = "\n".join(f"- `{name}`" for name in _SCRIPTS_CONFIG.keys()) or "- `(none configured)`"
     help_text = (
-        "**telegram-runner commands:**\n\n"
+        "**kira commands:**\n\n"
         "**Script Execution**\n"
         "/run <alias> [args] — Run a script\n"
         "/shell <command> — Run shell command\n"
@@ -1005,7 +1006,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "**Misc**\n"
         "/remind <Xm|Xh> <msg> — Set reminder\n"
         "/help — This message\n\n"
-        f"**Script aliases:** {aliases}"
+        f"**Script aliases:**\n{alias_lines}"
     )
     await update.message.reply_text(help_text[:4000])
 
