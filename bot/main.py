@@ -102,6 +102,8 @@ def main() -> None:
         "watches": handlers.handle_watches,
         "unwatch": handlers.handle_unwatch,
         "remind": handlers.handle_remind,
+        "list_apps": handlers.handle_list_apps,
+        "close_apps": handlers.handle_close_apps,
         "help": handlers.handle_help,
     }
 

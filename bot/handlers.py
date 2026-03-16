@@ -991,8 +991,9 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "**Clipboard**\n"
         "/copy <text> — Set clipboard\n"
         "/paste — Get clipboard\n\n"
-        "**Screenshot**\n"
-        "/screenshot [n] — Capture screen\n\n"
+        "**Application Management**\n"
+        "/list_apps — List running applications\n"
+        "/close_apps <app1> [app2] — Close applications\n\n"
         "**Power**\n"
         "/sleep — Sleep PC\n"
         "/shutdown <min> — Schedule shutdown\n"
@@ -1055,6 +1056,133 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         token = data[len("cancel_"):]
         _PENDING_CONFIRMS.pop(token, None)
         await query.edit_message_text("❌ Cancelled.")
+
+
+# ── Application Management Commands ────────────────────────────────
+
+def _is_system_process(process_name: str, executable_path: str) -> bool:
+    """Check if a process is a Windows system process."""
+    # System process names to exclude
+    system_names = {
+        'explorer.exe', 'winlogon.exe', 'csrss.exe', 'lsass.exe',
+        'services.exe', 'svchost.exe', 'system', 'idle', 'smss.exe',
+        'dwm.exe', 'conhost.exe', 'spoolsv.exe', 'taskmgr.exe'
+    }
+    
+    # System paths to exclude
+    system_paths = {
+        'c:\\windows\\system32\\',
+        'c:\\windows\\syswow64\\',
+        'c:\\windows\\',
+        'c:\\program files\\windows defender\\',
+        'c:\\program files (x86)\\windows defender\\'
+    }
+    
+    # Check by name
+    if process_name in system_names:
+        return True
+    
+    # Check by path
+    if executable_path:
+        for sys_path in system_paths:
+            if executable_path.startswith(sys_path):
+                return True
+    
+    return False
+
+
+@require_auth
+async def handle_list_apps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/list_apps`` — list running installed applications."""
+    apps = {}
+    
+    for proc in psutil.process_iter(['pid', 'name', 'exe']):
+        proc_name = proc.info['name'].lower()
+        proc_exe = proc.info.get('exe', '') if proc.info.get('exe') else ''
+        
+        # Skip system processes
+        if _is_system_process(proc_name, proc_exe.lower()):
+            continue
+        
+        # Group by application name (use executable name if available)
+        if proc_exe:
+            app_name = Path(proc_exe).stem.lower()
+        else:
+            app_name = proc_name
+        
+        apps.setdefault(app_name, []).append({
+            'pid': proc.info['pid'],
+            'name': proc.info['name']
+        })
+    
+    lines = ["📋 Running applications:\n"]
+    for app_name, processes in sorted(apps.items()):
+        if len(processes) == 1:
+            lines.append(f"• {app_name} (PID {processes[0]['pid']})")
+        else:
+            pids = [p['pid'] for p in processes]
+            lines.append(f"• {app_name} ({len(processes)} instances: {', '.join(map(str, pids))})")
+    
+    if not apps:
+        lines.append("No user applications running.")
+    
+    await update.message.reply_text("\n".join(lines)[:4000])
+
+
+@require_auth
+async def handle_close_apps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/close_apps`` — close specified installed applications."""
+    if not context.args:
+        await update.message.reply_text("Usage: /close_apps <app1> [app2]...")
+        return
+    
+    apps_to_close = context.args
+    closed_count = 0
+    failed_count = 0
+    
+    lines = [f"🔄 Closing applications:\n"]
+    
+    for app_name in apps_to_close:
+        try:
+            # Find processes matching the app name
+            matching_processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                proc_name = proc.info['name'].lower()
+                proc_exe = proc.info.get('exe', '').lower() if proc.info.get('exe') else ''
+                
+                # Match by process name or executable path
+                if (app_name.lower() in proc_name or 
+                    app_name.lower() in proc_exe):
+                    
+                    # Skip system processes
+                    if _is_system_process(proc_name, proc_exe):
+                        continue
+                        
+                    matching_processes.append(proc)
+            
+            if not matching_processes:
+                lines.append(f"❌ {app_name} - no running instances found")
+                failed_count += 1
+                continue
+            
+            # Close all matching processes
+            for proc in matching_processes:
+                proc.terminate()
+                proc_name = proc.info['name']
+                lines.append(f"✅ {app_name} - closed {proc_name} (PID {proc.pid})")
+                closed_count += 1
+                
+        except psutil.NoSuchProcess:
+            lines.append(f"⚠️ {app_name} - process already terminated")
+        except psutil.AccessDenied:
+            lines.append(f"❌ {app_name} - access denied")
+            failed_count += 1
+        except Exception as exc:
+            lines.append(f"❌ {app_name} - error: {exc}")
+            failed_count += 1
+    
+    lines.append(f"\n📊 Summary: {closed_count} closed, {failed_count} failed")
+    await update.message.reply_text("\n".join(lines))
 
 
 # ── Helpers ───────────────────────────────────────────────────────
