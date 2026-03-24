@@ -8,4 +8,6 @@ venv/
 dist/
 build/
 telegram_runner_spec.md
-config/
+scripts.toml
+jarvis_like.md
+context.md

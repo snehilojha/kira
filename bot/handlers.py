@@ -7,6 +7,7 @@ watchdog, and notifier — they never contain business logic directly.
 
 import asyncio
 import io
+import json
 import logging
 import os
 import re
@@ -974,7 +975,9 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/schedule <alias> <time> — Schedule a run\n"
         "/schedules — List pending schedules\n"
         "/unschedule <id> — Cancel a schedule\n\n"
-        "**ML / System**\n"
+        "**Natural Language**\n"
+        "/ask <request> — Translate plain English to commands\n\n"
+        "**System**\n"
         "/sysinfo — CPU, RAM, GPU, disk\n"
         "/getfile <path> — Send file from PC to phone (up to 50 MB)\n"
         "/putfile [path] — Save file from phone to PC\n"
@@ -1232,3 +1235,481 @@ def _parse_delay(spec: str) -> float | None:
         except ValueError:
             return None
     return None
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NATURAL LANGUAGE COMMAND TRANSLATION (/ask)
+# ══════════════════════════════════════════════════════════════════
+
+# Telegram callback_data has a 64-byte limit, so args are serialised as
+# a JSON list embedded in the callback token rather than space-joined strings.
+# Format: "ask_yes|<command>|<json-args>"  e.g. ask_yes|/shell|["dir C:\\"]
+_CB_MAX = 64
+
+
+def _encode_ask_cb(command: str, args: list[str]) -> str:
+    """Encode command + args into a callback_data string <= 64 bytes.
+
+    Falls back to truncating the args JSON if it would exceed the limit.
+    """
+    args_json = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+    token = f"ask_yes|{command}|{args_json}"
+    # Telegram limit is 64 bytes; truncate args gracefully if needed
+    while len(token.encode()) > _CB_MAX and args:
+        args = args[:-1]
+        args_json = json.dumps(args, ensure_ascii=False, separators=(",", ":"))
+        token = f"ask_yes|{command}|{args_json}"
+    return token
+
+
+def _decode_ask_cb(data: str) -> tuple[str, list[str]]:
+    """Decode callback_data back into (command, args).
+
+    Returns ("", []) on any parse error.
+    """
+    try:
+        _, command, args_json = data.split("|", 2)
+        args = json.loads(args_json)
+        if not isinstance(args, list):
+            args = []
+        return command, [str(a) for a in args]
+    except Exception:
+        return "", []
+
+
+@require_auth
+async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Translate natural language to a Kira command using GPT-4o Mini."""
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        await update.message.reply_text("Error: openai package not installed. Run: pip install openai")
+        return
+
+    # Strip the "/ask " prefix to get only the user's natural language query
+    raw_text = update.message.text or ""
+    user_message = raw_text.split(" ", 1)[1].strip() if " " in raw_text else ""
+
+    if not user_message:
+        await update.message.reply_text("Usage: /ask <your request in plain English>")
+        return
+
+    await update.message.reply_text("Thinking...")
+
+    try:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            await update.message.reply_text("Error: OPENAI_API_KEY not set in .env")
+            return
+
+        client = AsyncOpenAI(api_key=api_key)
+
+        scripts_info = "\n".join(
+            f"- {alias}: {cfg.get('path', 'N/A')}"
+            for alias, cfg in _SCRIPTS_CONFIG.items()
+        ) or "- (none configured)"
+
+        processes = process_registry.list_processes()
+        processes_info = "\n".join(
+            f"- PID {p['pid']}: {p['alias']} (running)"
+            for p in processes
+        ) if processes else "- No running processes"
+
+        system_prompt = f"""You are a command translator for a Telegram bot called Kira.
+Your job is to convert natural language requests into exact Kira commands.
+
+Available commands:
+- /run <alias> - Execute a script from scripts.toml
+- /run <alias> <args> - Execute with extra arguments
+- /shell <command> - Run a shell command
+- /status - List running processes
+- /kill <pid> - Kill a process
+- /schedule <alias> <time> - Schedule a script (e.g., 23:00, 30m, 2h)
+- /schedules - List pending schedules
+- /sysinfo - Show system info (CPU, RAM, GPU)
+- /screenshot - Take a screenshot
+- /ls [path] - List directory
+- /find <pattern> [path] - Find files
+- /tail <path> [n] - Show last lines of file
+- /copy <text> - Copy to clipboard
+- /paste - Get clipboard content
+- /sleep - Put PC to sleep
+- /shutdown <minutes> - Schedule shutdown
+- /reboot <minutes> - Schedule reboot
+- /watch pid <pid> - Watch a process
+- /watch file <path> - Watch a file
+- /watches - List active watches
+- /remind <time> <message> - Set a reminder
+
+Available script aliases:
+{scripts_info}
+
+Currently running processes:
+{processes_info}
+
+Instructions:
+1. Analyse the user's request.
+2. Map it to the single most appropriate Kira command.
+3. Return ONLY a JSON object — no prose, no markdown fences.
+
+Response format (examples):
+{{"command": "/run", "args": ["crypto_train_explore", "--fee_mult", "10"]}}
+{{"command": "/shell", "args": ["dir C:\\\\Users"]}}
+{{"command": "/status", "args": []}}"""
+
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            temperature=0.1,
+            max_tokens=200,
+        )
+
+        result_text = response.choices[0].message.content.strip()
+
+        # Remove accidental markdown code fences if the model adds them
+        result_text = re.sub(r"^```[a-z]*\n?", "", result_text)
+        result_text = re.sub(r"\n?```$", "", result_text)
+        result_text = result_text.strip()
+
+        try:
+            parsed = json.loads(result_text)
+        except json.JSONDecodeError:
+            # Try to extract a JSON object from free-form text
+            match = re.search(r'\{.*\}', result_text, re.DOTALL)
+            if match:
+                try:
+                    parsed = json.loads(match.group())
+                except json.JSONDecodeError:
+                    await update.message.reply_text(
+                        f"Could not parse model response:\n{result_text}"
+                    )
+                    return
+            else:
+                await update.message.reply_text(
+                    f"Could not parse model response:\n{result_text}"
+                )
+                return
+
+        command = parsed.get("command", "").strip()
+        args = [str(a) for a in parsed.get("args", [])]
+
+        if not command:
+            await update.message.reply_text(
+                "Could not understand the request. Try being more specific."
+            )
+            return
+
+        args_display = " ".join(args)
+        confirmation_text = (
+            f"Proposed command:\n`{command} {args_display}`\n\nExecute?"
+        )
+
+        callback_data = _encode_ask_cb(command, args)
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Yes", callback_data=callback_data),
+                InlineKeyboardButton("Cancel", callback_data="ask_cancel"),
+            ]
+        ])
+
+        await update.message.reply_text(
+            confirmation_text,
+            reply_markup=keyboard,
+            parse_mode="Markdown",
+        )
+
+    except Exception as exc:
+        logger.error("handle_ask error: %s", exc, exc_info=True)
+        await update.message.reply_text(f"Error: {exc}")
+
+
+async def handle_ask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle Yes/Cancel callbacks for /ask confirmations."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    # Replies go to the chat via query.message, not update.message (which is None
+    # in a callback context).
+    reply = query.message.reply_text
+
+    if data == "ask_cancel":
+        await query.edit_message_text("Cancelled.")
+        return
+
+    if not data.startswith("ask_yes|"):
+        return
+
+    command, args = _decode_ask_cb(data)
+    if not command:
+        await query.edit_message_text("Error: could not decode command.")
+        return
+
+    args_display = " ".join(args)
+    await query.edit_message_text(f"Executing: `{command} {args_display}`", parse_mode="Markdown")
+
+    if command == "/run":
+        if not args:
+            await reply("Error: /run requires an alias.")
+            return
+        await _ask_exec_run(reply, args)
+
+    elif command == "/shell":
+        if not args:
+            await reply("Error: /shell requires a command.")
+            return
+        await _ask_exec_shell(reply, args)
+
+    elif command == "/schedule":
+        if len(args) < 2:
+            await reply("Error: /schedule requires <alias> <time>.")
+            return
+        await _ask_exec_schedule(reply, args)
+
+    elif command == "/status":
+        processes = process_registry.list_processes()
+        if not processes:
+            await reply("No running processes.")
+        else:
+            lines = ["Running processes:\n"]
+            for p in processes:
+                runtime = _format_runtime(p["runtime_seconds"])
+                lines.append(f"PID {p['pid']} — {p['alias']} — {runtime}")
+            await reply("\n".join(lines))
+
+    elif command == "/kill":
+        if not args:
+            await reply("Error: /kill requires a PID.")
+            return
+        try:
+            pid = int(args[0])
+        except ValueError:
+            await reply("Error: PID must be an integer.")
+            return
+        result = await process_registry.kill(pid)
+        await reply(result)
+
+    elif command == "/sysinfo":
+        cpu = psutil.cpu_percent(interval=1)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage("C:\\")
+        lines = [
+            "System Info\n",
+            f"CPU:  {cpu}%",
+            f"RAM:  {mem.used / (1024**3):.1f} / {mem.total / (1024**3):.1f} GB ({mem.percent}%)",
+            f"Disk: {disk.free / (1024**3):.1f} GB free / {disk.total / (1024**3):.1f} GB ({disk.percent}%)",
+        ]
+        await reply("\n".join(lines))
+
+    elif command == "/screenshot":
+        try:
+            with mss.mss() as sct:
+                screenshot = sct.grab(sct.monitors[0])
+                png_bytes = mss.tools.to_png(screenshot.rgb, screenshot.size)
+            bio = io.BytesIO(png_bytes)
+            bio.name = "screenshot.png"
+            await query.message.reply_photo(photo=bio)
+        except Exception as exc:
+            await reply(f"Screenshot failed: {exc}")
+
+    elif command == "/ls":
+        target = Path(args[0]) if args else get_cwd()
+        try:
+            entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+            lines = [f"{target}\n"]
+            for entry in entries[:100]:
+                prefix = "[dir]" if entry.is_dir() else "[file]"
+                lines.append(f"{prefix} {entry.name}")
+            await reply("\n".join(lines)[:4000])
+        except Exception as exc:
+            await reply(f"Error: {exc}")
+
+    elif command == "/find":
+        if not args:
+            await reply("Error: /find requires a pattern.")
+            return
+        pattern = args[0]
+        search_root = Path(args[1]) if len(args) > 1 else get_cwd()
+        try:
+            matches = []
+            for m in search_root.rglob(pattern):
+                matches.append(str(m))
+                if len(matches) >= 50:
+                    break
+            if matches:
+                await reply("\n".join(matches)[:4000])
+            else:
+                await reply("No matches found.")
+        except Exception as exc:
+            await reply(f"Error: {exc}")
+
+    elif command == "/tail":
+        if not args:
+            await reply("Error: /tail requires a path.")
+            return
+        try:
+            n = int(args[1]) if len(args) > 1 else 20
+        except ValueError:
+            n = 20
+        try:
+            lines = Path(args[0]).read_text(encoding="utf-8", errors="replace").splitlines()
+            await reply("\n".join(lines[-n:])[:4000])
+        except Exception as exc:
+            await reply(f"Error: {exc}")
+
+    elif command == "/copy":
+        if not args:
+            await reply("Error: /copy requires text.")
+            return
+        text = " ".join(args)
+        pyperclip.copy(text)
+        await reply(f"Copied to clipboard ({len(text)} chars).")
+
+    elif command == "/paste":
+        content = pyperclip.paste()
+        await reply(content[:4000] if content else "Clipboard is empty.")
+
+    elif command == "/sleep":
+        await reply("Putting PC to sleep...")
+        os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
+
+    elif command == "/shutdown":
+        try:
+            minutes = int(args[0]) if args else 0
+        except ValueError:
+            await reply("Error: minutes must be an integer.")
+            return
+        os.system(f"shutdown /s /t {minutes * 60}")
+        await reply(f"Shutdown scheduled in {minutes} minutes.")
+
+    elif command == "/reboot":
+        try:
+            minutes = int(args[0]) if args else 0
+        except ValueError:
+            await reply("Error: minutes must be an integer.")
+            return
+        os.system(f"shutdown /r /t {minutes * 60}")
+        await reply(f"Reboot scheduled in {minutes} minutes.")
+
+    elif command == "/remind":
+        if len(args) < 2:
+            await reply("Error: /remind requires <time> <message>.")
+            return
+        delay = _parse_delay(args[0])
+        if delay is None:
+            await reply("Invalid time. Use Xm or Xh.")
+            return
+        msg = " ".join(args[1:])
+        await reply(f"Reminder set for {args[0]} from now.")
+
+        async def _fire() -> None:
+            await asyncio.sleep(delay)
+            await notifier.send(f"Reminder: {msg}")
+
+        asyncio.create_task(_fire())
+
+    elif command == "/watches":
+        items = watchdog.list_watches()
+        if not items:
+            await reply("No active watchers.")
+        else:
+            lines = ["Active watchers:\n"] + [
+                f"{w['id']} — {w['type']}: {w['target']}" for w in items
+            ]
+            await reply("\n".join(lines))
+
+    elif command == "/schedules":
+        items = scheduler.list_schedules()
+        if not items:
+            await reply("No pending scheduled runs.")
+        else:
+            lines = ["Pending schedules:\n"] + [
+                f"{s['id']} — {s['alias']} at {s['run_at']}" for s in items
+            ]
+            await reply("\n".join(lines))
+
+    else:
+        await reply(f"Command '{command}' is not yet supported via /ask.")
+
+
+# ── /ask execution helpers ─────────────────────────────────────────
+
+async def _ask_exec_run(reply, args: list[str]) -> None:
+    """Run a script alias from an /ask callback."""
+    alias = args[0]
+    script_args = args[1:]
+    script = _get_script(alias)
+    if not script:
+        await reply(f"Unknown alias: {alias}")
+        return
+    interpreter = script.get("interpreter")
+    path = script.get("path")
+    timeout = script.get("timeout", _DEFAULT_TIMEOUT)
+    checkpoint = script.get("checkpoint_interval")
+    full_args = list(script.get("args", [])) + script_args
+    await reply(f"Running {alias}...")
+    try:
+        gen = executor.run_command(interpreter, path, full_args, timeout, alias=alias, checkpoint_interval=checkpoint)
+        async for chunk in gen:
+            if chunk.strip():
+                await reply(chunk[:4000])
+    except Exception as exc:
+        await reply(f"Error: {exc}")
+
+
+async def _ask_exec_shell(reply, args: list[str]) -> None:
+    """Run a shell command from an /ask callback using executor (non-blocking)."""
+    command = " ".join(args)
+    if _DESTRUCTIVE_PATTERNS.search(command):
+        await reply("Destructive command detected. Use /shell directly to confirm.")
+        return
+    timeout = int(os.environ.get("DEFAULT_TIMEOUT", "30"))
+    await reply(f"Running: `{command}`")
+    try:
+        gen = executor.run_shell(command, timeout=timeout)
+        async for chunk in gen:
+            if chunk.strip():
+                await reply(chunk[:4000])
+    except Exception as exc:
+        await reply(f"Error: {exc}")
+
+
+async def _ask_exec_schedule(reply, args: list[str]) -> None:
+    """Schedule a script from an /ask callback."""
+    alias = args[0]
+    time_spec = args[1]
+    script = _get_script(alias)
+    if not script:
+        await reply(f"Unknown alias: {alias}")
+        return
+    target_time = _parse_time_spec(time_spec)
+    if not target_time:
+        await reply("Invalid time format. Use HH:MM, Xm, or Xh.")
+        return
+
+    async def _run_scheduled(a: str) -> None:
+        """Callback invoked by the scheduler when the time arrives."""
+        s = _get_script(a)
+        if s is None:
+            await notifier.send(f"Scheduled run failed — alias {a} not found.")
+            return
+        gen = executor.run_command(
+            interpreter=s["interpreter"],
+            script_path=s["path"],
+            args=list(s.get("args", [])),
+            timeout=s.get("timeout", _DEFAULT_TIMEOUT),
+            alias=a,
+            checkpoint_interval=s.get("checkpoint_interval"),
+        )
+        output_lines = []
+        async for chunk in gen:
+            output_lines.append(chunk)
+        full_output = "\n".join(output_lines)
+        if full_output.strip():
+            await notifier.send(f"Output from scheduled {a}:\n{full_output[-3000:]}")
+
+    sid = await scheduler.schedule(alias, target_time, _run_scheduled)
+    await reply(f"Scheduled {alias} for {target_time.strftime('%H:%M')} (ID: {sid}).")

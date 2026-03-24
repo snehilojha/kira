@@ -7,11 +7,14 @@ and starts the long-polling event loop.
 import logging
 import os
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
+from telegram import Update
+from telegram.error import NetworkError, TimedOut
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from bot import handlers
 from bot import notifier
@@ -50,6 +53,41 @@ def _setup_logging() -> None:
     root_logger.addHandler(console_handler)
 
 
+def _wait_for_network(max_wait: int = 120, check_interval: int = 5) -> bool:
+    """Block until a basic TCP connection to Telegram's API succeeds.
+
+    Returns True once reachable, False if max_wait seconds elapse.
+    """
+    import socket
+    deadline = time.monotonic() + max_wait
+    logger = logging.getLogger(__name__)
+    while time.monotonic() < deadline:
+        try:
+            socket.setdefaulttimeout(5)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect(("api.telegram.org", 443))
+            sock.close()
+            return True
+        except OSError:
+            remaining = int(deadline - time.monotonic())
+            logger.info(
+                "Network not ready yet — retrying in %ds (%ds remaining)",
+                check_interval, remaining,
+            )
+            time.sleep(check_interval)
+    return False
+
+
+async def _error_handler(update: object, context) -> None:
+    """Log NetworkError and TimedOut silently; re-raise all other exceptions."""
+    logger = logging.getLogger(__name__)
+    exc = context.error
+    if isinstance(exc, (NetworkError, TimedOut)):
+        logger.warning("Transient network error (will retry): %s", exc)
+        return
+    logger.error("Unhandled exception in handler", exc_info=exc)
+
+
 def main() -> None:
     """Load config, register handlers, start polling."""
     # 1. Load environment
@@ -63,6 +101,11 @@ def main() -> None:
     _setup_logging()
     logger = logging.getLogger(__name__)
     logger.info("telegram-runner starting up")
+
+    # 2a. Wait for network before doing anything Telegram-related
+    if not _wait_for_network():
+        logger.error("Network unavailable after 120s — aborting startup")
+        sys.exit(1)
 
     # 3. Init shared modules
     load_allowed_users()
@@ -105,15 +148,29 @@ def main() -> None:
         "list_apps": handlers.handle_list_apps,
         "close_apps": handlers.handle_close_apps,
         "help": handlers.handle_help,
+        "ask": handlers.handle_ask,
     }
 
     for name, handler in command_map.items():
         app.add_handler(CommandHandler(name, handler))
 
-    # 6. Inline button callback handler (confirmations)
-    app.add_handler(CallbackQueryHandler(handlers.handle_callback_query))
+    # 6. Register error handler so NetworkErrors don't crash the polling loop
+    app.add_error_handler(_error_handler)
 
-    # 7a. Media messages with /putfile caption — CommandHandler won't fire on these
+    # 7. Unified callback handler for all inline buttons (confirmations and /ask)
+    async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Route callback queries to appropriate handlers."""
+        query = update.callback_query
+        data = query.data or ""
+        
+        if data.startswith("ask_"):
+            await handlers.handle_ask_callback(update, context)
+        else:
+            await handlers.handle_callback_query(update, context)
+    
+    app.add_handler(CallbackQueryHandler(unified_callback_handler))
+
+    # 8a. Media messages with /putfile caption — CommandHandler won't fire on these
     _media_filter = (
         filters.Document.ALL
         | filters.PHOTO

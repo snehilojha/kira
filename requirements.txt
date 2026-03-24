@@ -8,3 +8,4 @@ GPUtil
 pyperclip
 mss
 httpx
+openai>=1.0.0
