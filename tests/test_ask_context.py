@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from collections import deque
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 _fake_telegram = types.ModuleType("telegram")
 _fake_telegram_ext = types.ModuleType("telegram.ext")
@@ -137,14 +137,17 @@ class AskContextTests(unittest.TestCase):
 
     def test_build_ask_system_prompt_includes_project_and_live_context(self) -> None:
         """The system prompt should include project context and live state snapshots."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "context.md"
-            path.write_text("active project: kira\npriority: test", encoding="utf-8")
-            handlers._PROJECT_CONTEXT_PATH = path
-            handlers._RECENT_OUTPUT_LINES.append("training started")
+        async def _run() -> str:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "context.md"
+                path.write_text("active project: kira\npriority: test", encoding="utf-8")
+                handlers._PROJECT_CONTEXT_PATH = path
+                handlers._RECENT_OUTPUT_LINES.append("training started")
 
-            with patch.object(handlers.process_registry, "list_processes", return_value=[{"pid": 11, "alias": "train", "runtime_seconds": 65, "returncode": None}]), patch.object(handlers.scheduler, "list_schedules", return_value=[{"id": "sched-1", "alias": "eval", "run_at": "2026-03-26T12:00:00"}]), patch.object(handlers.watchdog, "list_watches", return_value=[{"id": "watch-1", "type": "pid", "target": "11", "label": "train"}]), patch.object(handlers.psutil, "cpu_percent", return_value=12.5), patch.object(handlers.psutil, "virtual_memory", return_value=type("vm", (), {"percent": 33.3})()), patch("bot.handlers._format_runtime", return_value="1m 5s"):
-                prompt = handlers._build_ask_system_prompt()
+                with patch.object(handlers.process_registry, "list_processes", return_value=[{"pid": 11, "alias": "train", "runtime_seconds": 65, "returncode": None}]), patch.object(handlers.scheduler, "list_schedules", return_value=[{"id": "sched-1", "alias": "eval", "run_at": "2026-03-26T12:00:00"}]), patch.object(handlers.watchdog, "list_watches", return_value=[{"id": "watch-1", "type": "pid", "target": "11", "label": "train"}]), patch.object(handlers.psutil, "cpu_percent", return_value=12.5), patch.object(handlers.psutil, "virtual_memory", return_value=type("vm", (), {"percent": 33.3})()), patch("bot.handlers._format_runtime", return_value="1m 5s"), patch("bot.handlers._format_conversation_history", new_callable=AsyncMock, return_value=""):
+                    return await handlers._build_ask_system_prompt()
+
+        prompt = asyncio.run(_run())
 
         self.assertIn("active project: kira", prompt)
         self.assertIn("Running processes:", prompt)

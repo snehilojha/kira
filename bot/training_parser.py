@@ -12,7 +12,9 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 
+from bot import db
 from bot import notifier
 
 logger = logging.getLogger(__name__)
@@ -102,11 +104,14 @@ async def check_line(line: str, state: ParserState) -> None:
 async def on_finish(state: ParserState, timed_out: bool = False) -> None:
     """Send a final training summary when the script exits cleanly or times out."""
     label = "timed out" if timed_out else "finished"
+    exit_code = 0 if not timed_out else -1
+    await _log_run_to_db(state, exit_code)
     await _send_summary(state, final=True, label=label)
 
 
 async def on_crash(state: ParserState, exit_code: int) -> None:
     """Send a crash report with the last stderr lines."""
+    await _log_run_to_db(state, exit_code)
     elapsed = _format_elapsed(time.time() - state.start_time)
     stderr_block = "\n".join(state.stderr_tail) if state.stderr_tail else "(no stderr captured)"
     msg = (
@@ -128,7 +133,6 @@ async def _send_summary(state: ParserState, final: bool = False, label: str = "c
         elapsed_secs = time.time() - state.start_time
         if elapsed_secs > 0:
             steps_per_sec = state.total_timesteps / elapsed_secs
-            # We don't know the target, so ETA is just informational
             eta_str = f"  Rate:      {steps_per_sec:,.0f} steps/s\n"
 
     reward_line = ""
@@ -142,11 +146,66 @@ async def _send_summary(state: ParserState, final: bool = False, label: str = "c
     ep_len_line = f"  Ep length: {state.ep_len:.0f} avg\n" if state.ep_len is not None else ""
     loss_line = f"  Loss:      {state.loss}\n" if state.loss is not None else ""
 
+    # Proactive comparison against the previous successful run.
+    comparison_line = ""
+    if final:
+        comparison_line = await _build_comparison_line(state)
+
     icon = "✅" if final and label == "finished" else "⏰" if final and label == "timed out" else "✓"
     header = f"{icon} {state.alias} — {label} @ {state.total_timesteps:,} steps"
 
-    msg = f"{header}\n{reward_line}{ep_len_line}{loss_line}  Elapsed:   {elapsed}\n{eta_str}"
+    msg = f"{header}\n{reward_line}{ep_len_line}{loss_line}  Elapsed:   {elapsed}\n{eta_str}{comparison_line}"
     await notifier.send(msg.rstrip())
+
+
+async def _log_run_to_db(state: ParserState, exit_code: int) -> None:
+    """Persist the run's final metrics to the database."""
+    runtime = time.time() - state.start_time
+    started_at = datetime.fromtimestamp(state.start_time).isoformat()
+    finished_at = datetime.now().isoformat()
+    try:
+        await db.log_run(
+            alias=state.alias,
+            started_at=started_at,
+            finished_at=finished_at,
+            exit_code=exit_code,
+            runtime_seconds=runtime,
+            total_timesteps=state.total_timesteps or None,
+            reward=state.reward,
+            ep_len=state.ep_len,
+            loss=state.loss,
+        )
+    except Exception:
+        logger.warning("Failed to log run to DB for %s", state.alias, exc_info=True)
+
+
+async def _build_comparison_line(state: ParserState) -> str:
+    """Compare current run metrics against the previous successful run."""
+    try:
+        prev = await db.get_previous_run_metrics(state.alias)
+    except Exception:
+        return ""
+    if prev is None:
+        return ""
+
+    parts: list[str] = []
+    prev_reward = prev.get("reward")
+    if prev_reward is not None and state.reward is not None:
+        delta = state.reward - prev_reward
+        if prev_reward != 0:
+            pct = (delta / abs(prev_reward)) * 100
+            direction = "↑" if delta > 0 else "↓"
+            parts.append(f"reward {prev_reward:.4f}→{state.reward:.4f} {direction}{abs(pct):.0f}%")
+        else:
+            parts.append(f"reward {prev_reward:.4f}→{state.reward:.4f}")
+
+    prev_loss = prev.get("loss")
+    if prev_loss is not None and state.loss is not None:
+        parts.append(f"loss {prev_loss}→{state.loss}")
+
+    if not parts:
+        return ""
+    return f"  vs prev:   {', '.join(parts)}\n"
 
 
 def _format_elapsed(seconds: float) -> str:

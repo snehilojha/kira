@@ -6,6 +6,8 @@ logs/
 venv/
 *.egg-info/
 dist/
+data/
+tests/
 build/
 telegram_runner_spec.md
 scripts.toml

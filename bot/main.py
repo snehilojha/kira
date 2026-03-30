@@ -16,6 +16,7 @@ from telegram import Update
 from telegram.error import NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
+from bot import db
 from bot import handlers
 from bot import monitor
 from bot import notifier
@@ -116,6 +117,8 @@ def main() -> None:
     # 4. Build application
     async def _post_init(application) -> None:
         """Start background tasks once the Telegram application is ready."""
+        await db.init_db()
+        await handlers.reload_reminders()
         application.create_task(monitor.start_monitor())
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
@@ -155,6 +158,8 @@ def main() -> None:
         "close_apps": handlers.handle_close_apps,
         "help": handlers.handle_help,
         "ask": handlers.handle_ask,
+        "history": handlers.handle_history,
+        "runs": handlers.handle_runs,
     }
 
     for name, handler in command_map.items():

@@ -27,6 +27,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
 from bot.auth import require_auth
+from bot import db
 from bot import executor
 from bot import notifier
 from bot import process_registry
@@ -98,11 +99,20 @@ _RECENT_OUTPUT_LINES: deque[str] = deque(maxlen=20)
 
 async def _stream_to_chat(update: Update, gen) -> None:
     """Consume an async generator from executor and send chunks as messages."""
+    collected: list[str] = []
     async for chunk in gen:
         if chunk.strip():
             _record_recent_output(chunk)
+            collected.append(chunk.strip())
             # Telegram limit is 4096; executor already caps at 4000
             await update.message.reply_text(chunk[:4000])
+    # Persist a summary of the output for conversation history.
+    if collected:
+        tail = "\n".join(collected)[-2000:]
+        try:
+            await db.log_conversation("assistant", tail)
+        except Exception:
+            logger.debug("Failed to log streamed output to DB", exc_info=True)
 
 
 def _record_recent_output(text: str) -> None:
@@ -221,7 +231,24 @@ def _format_system_snapshot() -> str:
     return " | ".join(lines)
 
 
-def _build_ask_system_prompt() -> str:
+async def _format_conversation_history() -> str:
+    """Fetch recent conversation log from DB and format for prompt injection."""
+    try:
+        rows = await db.get_recent_conversations(10)
+    except Exception:
+        logger.debug("Failed to fetch conversation history from DB", exc_info=True)
+        return ""
+    if not rows:
+        return ""
+    lines = ["Recent conversation history:"]
+    for row in rows:
+        role = row["role"].capitalize()
+        content = row["content"][:300]
+        lines.append(f"  [{role}] {content}")
+    return "\n".join(lines)
+
+
+async def _build_ask_system_prompt() -> str:
     """Build the system prompt used by /ask and voice translation."""
     scripts_info = "\n".join(
         f"- {alias}: {cfg.get('path', 'N/A')}"
@@ -230,6 +257,7 @@ def _build_ask_system_prompt() -> str:
 
     project_context = _load_project_context()
     live_context = _format_live_context()
+    conversation_context = await _format_conversation_history()
 
     sections = [
         "You are a command translator for a Telegram bot called Kira.",
@@ -264,6 +292,12 @@ def _build_ask_system_prompt() -> str:
         "",
         live_context,
     ]
+
+    if conversation_context:
+        sections.extend([
+            "",
+            conversation_context,
+        ])
 
     if project_context:
         sections.extend([
@@ -1154,13 +1188,165 @@ async def handle_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("Invalid time. Use Xm or Xh (e.g. 30m, 2h).")
         return
 
+    fire_at = datetime.now() + timedelta(seconds=delay)
+
+    # Persist so the reminder survives a restart.
+    reminder_id: int | None = None
+    try:
+        reminder_id = await db.save_reminder(fire_at.isoformat(), message)
+    except Exception:
+        logger.debug("Failed to persist reminder to DB", exc_info=True)
+
     await update.message.reply_text(f"⏰ Reminder set for {time_spec} from now.")
 
     async def _fire_reminder() -> None:
         await asyncio.sleep(delay)
         await notifier.send(f"🔔 Reminder: {message}")
+        if reminder_id is not None:
+            try:
+                await db.mark_reminder_fired(reminder_id)
+            except Exception:
+                logger.debug("Failed to mark reminder %d as fired", reminder_id, exc_info=True)
 
     asyncio.create_task(_fire_reminder())
+
+
+async def reload_reminders() -> None:
+    """Restore pending reminders from the database after a restart.
+
+    Called once from ``main.py`` after ``db.init_db()``.
+    """
+    try:
+        pending = await db.get_pending_reminders()
+    except Exception:
+        logger.warning("Failed to reload reminders from DB", exc_info=True)
+        return
+
+    now = datetime.now()
+    restored = 0
+    for row in pending:
+        try:
+            fire_at = datetime.fromisoformat(row["fire_at"])
+        except (ValueError, TypeError):
+            logger.warning("Skipping reminder %d with invalid fire_at: %r", row["id"], row["fire_at"])
+            await db.mark_reminder_fired(row["id"])
+            continue
+
+        delay = (fire_at - now).total_seconds()
+        if delay <= 0:
+            # Already past due — fire immediately.
+            await notifier.send(f"🔔 Reminder (delayed): {row['message']}")
+            await db.mark_reminder_fired(row["id"])
+            restored += 1
+            continue
+
+        rid = row["id"]
+        msg = row["message"]
+
+        async def _fire(r_id: int = rid, r_msg: str = msg) -> None:
+            await asyncio.sleep(delay)
+            await notifier.send(f"🔔 Reminder: {r_msg}")
+            try:
+                await db.mark_reminder_fired(r_id)
+            except Exception:
+                logger.debug("Failed to mark reminder %d as fired", r_id, exc_info=True)
+
+        asyncio.create_task(_fire())
+        restored += 1
+
+    if restored:
+        logger.info("Restored %d pending reminder(s) from DB", restored)
+
+
+# ── History & Runs ────────────────────────────────────────────────
+
+@require_auth
+async def handle_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/history [n]`` — show recent conversation history."""
+    n = 20
+    if context.args:
+        try:
+            n = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text("Usage: /history [n]  (n = number of entries)")
+            return
+
+    try:
+        rows = await db.get_recent_conversations(n)
+    except Exception as exc:
+        await update.message.reply_text(f"Failed to read history: {exc}")
+        return
+
+    if not rows:
+        await update.message.reply_text("No conversation history yet.")
+        return
+
+    lines = [f"📜 Last {len(rows)} conversation entries:\n"]
+    for row in rows:
+        ts = row["timestamp"][:16] if row.get("timestamp") else "?"
+        role = row["role"].upper()
+        content = row["content"][:200]
+        lines.append(f"[{ts}] {role}: {content}")
+
+    await update.message.reply_text("\n".join(lines)[:4000])
+
+
+@require_auth
+async def handle_runs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/runs [alias] [n]`` — show recent run history with metrics."""
+    alias = None
+    limit = 10
+
+    if context.args:
+        # If the last arg is a number, treat it as the limit.
+        args = list(context.args)
+        if len(args) >= 1:
+            try:
+                limit = int(args[-1])
+                args = args[:-1]
+            except ValueError:
+                pass
+        if args:
+            alias = args[0]
+
+    try:
+        rows = await db.get_run_history(alias=alias, limit=limit)
+    except Exception as exc:
+        await update.message.reply_text(f"Failed to read run history: {exc}")
+        return
+
+    if not rows:
+        msg = f"No runs recorded for {alias}." if alias else "No runs recorded yet."
+        await update.message.reply_text(msg)
+        return
+
+    header = f"📊 Last {len(rows)} run(s)"
+    if alias:
+        header += f" for {alias}"
+    lines = [f"{header}:\n"]
+
+    for row in rows:
+        date = (row.get("finished_at") or row.get("started_at") or "?")[:16]
+        code = row.get("exit_code")
+        icon = "✅" if code == 0 else "❌" if code is not None else "?"
+        runtime = row.get("runtime_seconds")
+        runtime_str = _format_runtime(runtime) if runtime else "?"
+
+        parts = [f"{icon} {row['alias']} ({date}) — {runtime_str}"]
+
+        reward = row.get("reward")
+        if reward is not None:
+            parts.append(f"  reward={reward:.4f}")
+        loss = row.get("loss")
+        if loss is not None:
+            parts.append(f"  loss={loss}")
+        steps = row.get("total_timesteps")
+        if steps is not None:
+            parts.append(f"  steps={steps:,}")
+
+        lines.append("  ".join(parts))
+
+    await update.message.reply_text("\n".join(lines)[:4000])
 
 
 # ── Help ──────────────────────────────────────────────────────────
@@ -1214,8 +1400,11 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/watch file <path> — Watch file\n"
         "/watches — List watchers\n"
         "/unwatch <id> — Remove watcher\n\n"
+        "**History & Runs**\n"
+        "/history [n] — Show conversation history\n"
+        "/runs [alias] [n] — Show run history with metrics\n\n"
         "**Misc**\n"
-        "/remind <Xm|Xh> <msg> — Set reminder\n"
+        "/remind <Xm|Xh> <msg> — Set reminder (persists across restarts)\n"
         "/help — This message\n\n"
         f"**Script aliases:**\n{alias_lines}"
     )
@@ -1550,7 +1739,7 @@ async def _ask_core(user_message: str) -> tuple[str, list[str]] | None:
         raise RuntimeError("OPENAI_API_KEY not set in .env")
 
     client = AsyncOpenAI(api_key=api_key)
-    system_prompt = _build_ask_system_prompt()
+    system_prompt = await _build_ask_system_prompt()
 
     response = await client.chat.completions.create(
         model="gpt-4o-mini",
@@ -1608,6 +1797,12 @@ async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Usage: /ask <your request in plain English>")
         return
 
+    # Log the user's natural-language request for conversation history.
+    try:
+        await db.log_conversation("user", user_message)
+    except Exception:
+        logger.debug("Failed to log /ask user message to DB", exc_info=True)
+
     await update.message.reply_text("Thinking...")
 
     try:
@@ -1620,6 +1815,12 @@ async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         command, args = result
         confirmation_text = _build_ask_confirmation_text(command, args)
+
+        # Log Kira's proposed command for conversation history.
+        try:
+            await db.log_conversation("assistant", f"{command} {' '.join(args)}")
+        except Exception:
+            logger.debug("Failed to log /ask response to DB", exc_info=True)
 
         callback_data = _encode_ask_cb(command, args)
         keyboard = InlineKeyboardMarkup([
@@ -1687,6 +1888,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     # Echo the transcript so the user can verify what Kira heard.
     await msg.reply_text(f"🎙️ Heard: _{transcript}_", parse_mode="Markdown")
+
+    # Log the voice transcript for conversation history.
+    try:
+        await db.log_conversation("user", f"[voice] {transcript}")
+    except Exception:
+        logger.debug("Failed to log voice transcript to DB", exc_info=True)
 
     # --- Step 3: Translate transcript → command via GPT-4o Mini ---
     try:
@@ -1971,6 +2178,43 @@ async def handle_ask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"{s['id']} — {s['alias']} at {s['run_at']}" for s in items
             ]
             await reply("\n".join(lines))
+
+    elif command == "/history":
+        try:
+            n = int(args[0]) if args else 20
+        except ValueError:
+            n = 20
+        try:
+            rows = await db.get_recent_conversations(n)
+        except Exception as exc:
+            await reply(f"Error: {exc}")
+            return
+        if not rows:
+            await reply("No conversation history yet.")
+        else:
+            lines = [f"Last {len(rows)} entries:\n"]
+            for r in rows:
+                ts = r["timestamp"][:16] if r.get("timestamp") else "?"
+                lines.append(f"[{ts}] {r['role'].upper()}: {r['content'][:200]}")
+            await reply("\n".join(lines)[:4000])
+
+    elif command == "/runs":
+        alias_arg = args[0] if args else None
+        try:
+            rows = await db.get_run_history(alias=alias_arg, limit=10)
+        except Exception as exc:
+            await reply(f"Error: {exc}")
+            return
+        if not rows:
+            await reply("No runs recorded yet.")
+        else:
+            lines = [f"Last {len(rows)} run(s):\n"]
+            for r in rows:
+                code = r.get("exit_code")
+                icon = "✅" if code == 0 else "❌" if code is not None else "?"
+                rt = _format_runtime(r["runtime_seconds"]) if r.get("runtime_seconds") else "?"
+                lines.append(f"{icon} {r['alias']} — {rt}")
+            await reply("\n".join(lines)[:4000])
 
     else:
         await reply(f"Command '{command}' is not yet supported via /ask.")
