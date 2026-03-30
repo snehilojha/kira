@@ -157,7 +157,7 @@ async def run_shell(command: str, timeout: int = 30) -> AsyncGenerator[str, None
     async for chunk in run_command(
         interpreter="cmd.exe",
         script_path="/c",
-        args=command.split(),
+        args=[command],
         timeout=timeout,
         alias=f"shell:{command[:40]}",
         checkpoint_interval=None,

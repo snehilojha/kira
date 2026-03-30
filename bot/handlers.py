@@ -6,11 +6,13 @@ watchdog, and notifier — they never contain business logic directly.
 """
 
 import asyncio
+from collections import deque
 import io
 import json
 import logging
 import os
 import re
+import subprocess
 import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -29,6 +31,7 @@ from bot import executor
 from bot import notifier
 from bot import process_registry
 from bot import scheduler
+from bot import voice
 from bot import watchdog
 
 logger = logging.getLogger(__name__)
@@ -84,6 +87,12 @@ _DESTRUCTIVE_PATTERNS = re.compile(
 _PENDING_CONFIRMS: dict[str, dict] = {}
 _CONFIRM_TIMEOUT = 30  # seconds
 
+# Optional context file injected into the /ask system prompt.
+_PROJECT_CONTEXT_PATH = Path(os.environ.get("PROJECT_CONTEXT_PATH", str(Path(__file__).resolve().parent.parent / "context.md")))
+_PROJECT_CONTEXT_MAX_CHARS = 12000
+_RECENT_OUTPUT_MAX_CHARS = 2000
+_RECENT_OUTPUT_LINES: deque[str] = deque(maxlen=20)
+
 
 # ── Helper: stream executor output back to Telegram ───────────────
 
@@ -91,8 +100,205 @@ async def _stream_to_chat(update: Update, gen) -> None:
     """Consume an async generator from executor and send chunks as messages."""
     async for chunk in gen:
         if chunk.strip():
+            _record_recent_output(chunk)
             # Telegram limit is 4096; executor already caps at 4000
             await update.message.reply_text(chunk[:4000])
+
+
+def _record_recent_output(text: str) -> None:
+    """Store recent command output for prompt injection."""
+    cleaned = text.strip()
+    if cleaned:
+        _RECENT_OUTPUT_LINES.append(cleaned)
+
+
+def _get_recent_output_tail() -> str:
+    """Return the most recent command output tail, truncated for prompt safety."""
+    if not _RECENT_OUTPUT_LINES:
+        return "Recent command output: none"
+
+    tail = "\n".join(_RECENT_OUTPUT_LINES)
+    if len(tail) > _RECENT_OUTPUT_MAX_CHARS:
+        tail = tail[-_RECENT_OUTPUT_MAX_CHARS:]
+        tail = "[...recent output truncated...]\n" + tail
+    return f"Recent command output:\n{tail}"
+
+
+def _load_project_context() -> str:
+    """Return the project context file content, capped for prompt safety."""
+    try:
+        text = _PROJECT_CONTEXT_PATH.read_text(encoding="utf-8", errors="replace").strip()
+    except FileNotFoundError:
+        logger.warning("Project context file not found at %s", _PROJECT_CONTEXT_PATH)
+        return ""
+    except OSError as exc:
+        logger.warning("Could not read project context file %s: %s", _PROJECT_CONTEXT_PATH, exc)
+        return ""
+
+    if len(text) > _PROJECT_CONTEXT_MAX_CHARS:
+        return text[:_PROJECT_CONTEXT_MAX_CHARS] + "\n\n[...project context truncated...]"
+    return text
+
+
+def _format_live_context() -> str:
+    """Build a compact snapshot of the current bot/session state for /ask."""
+    processes = process_registry.list_processes()
+    schedules = scheduler.list_schedules()
+    watches = watchdog.list_watches()
+
+    lines = [
+        "Live session context:",
+        "",
+        _format_process_snapshot(processes),
+        "",
+        _format_schedule_snapshot(schedules),
+        "",
+        _format_watch_snapshot(watches),
+        "",
+        _get_recent_output_tail(),
+        "",
+        _format_system_snapshot(),
+    ]
+
+    return "\n".join(line for line in lines if line).strip()
+
+
+def _format_process_snapshot(processes: list[dict]) -> str:
+    """Format active subprocesses for prompt injection."""
+    if not processes:
+        return "Running processes: none"
+
+    lines = ["Running processes:"]
+    for proc in processes:
+        runtime = _format_runtime(proc["runtime_seconds"])
+        status = "running" if proc["returncode"] is None else f"exited({proc['returncode']})"
+        lines.append(f"- PID {proc['pid']}: {proc['alias']} ({runtime}, {status})")
+    return "\n".join(lines)
+
+
+def _format_schedule_snapshot(schedules: list[dict]) -> str:
+    """Format pending schedules for prompt injection."""
+    if not schedules:
+        return "Pending schedules: none"
+
+    lines = ["Pending schedules:"]
+    for schedule_entry in schedules:
+        lines.append(f"- {schedule_entry['id']}: {schedule_entry['alias']} at {schedule_entry['run_at']}")
+    return "\n".join(lines)
+
+
+def _format_watch_snapshot(watches: list[dict]) -> str:
+    """Format active watchers for prompt injection."""
+    if not watches:
+        return "Active watchers: none"
+
+    lines = ["Active watchers:"]
+    for watch_entry in watches:
+        lines.append(f"- {watch_entry['id']}: {watch_entry['type']} -> {watch_entry['target']}")
+    return "\n".join(lines)
+
+
+def _format_system_snapshot() -> str:
+    """Format a compact live CPU/RAM/GPU snapshot for prompt injection."""
+    cpu = psutil.cpu_percent(interval=0.0)
+    memory = psutil.virtual_memory()
+
+    lines = [
+        f"System snapshot: CPU {cpu:.1f}% | RAM {memory.percent:.1f}%",
+    ]
+
+    try:
+        import GPUtil
+
+        gpus = GPUtil.getGPUs()
+        temperatures = [float(gpu.temperature) for gpu in gpus if getattr(gpu, "temperature", None) is not None]
+        if temperatures:
+            lines.append(f"GPU temp: {max(temperatures):.1f}°C")
+    except Exception:
+        # GPU data is optional; failure here should not block /ask.
+        pass
+
+    return " | ".join(lines)
+
+
+def _build_ask_system_prompt() -> str:
+    """Build the system prompt used by /ask and voice translation."""
+    scripts_info = "\n".join(
+        f"- {alias}: {cfg.get('path', 'N/A')}"
+        for alias, cfg in _SCRIPTS_CONFIG.items()
+    ) or "- (none configured)"
+
+    project_context = _load_project_context()
+    live_context = _format_live_context()
+
+    sections = [
+        "You are a command translator for a Telegram bot called Kira.",
+        "Your job is to convert natural language requests into exact Kira commands.",
+        "",
+        "Available commands:",
+        "- /run <alias> - Execute a script from scripts.toml",
+        "- /run <alias> <args> - Execute with extra arguments",
+        "- /shell <command> - Run a shell command",
+        "- /status - List running processes",
+        "- /kill <pid> - Kill a process",
+        "- /schedule <alias> <time> - Schedule a script (e.g., 23:00, 30m, 2h)",
+        "- /schedules - List pending schedules",
+        "- /sysinfo - Show system info (CPU, RAM, GPU)",
+        "- /screenshot - Take a screenshot",
+        "- /ls [path] - List directory",
+        "- /find <pattern> [path] - Find files",
+        "- /tail <path> [n] - Show last lines of file",
+        "- /copy <text> - Copy to clipboard",
+        "- /paste - Get clipboard content",
+        "- /open <app> - Open an application by name",
+        "- /sleep - Put PC to sleep",
+        "- /shutdown <minutes> - Schedule shutdown",
+        "- /reboot <minutes> - Schedule reboot",
+        "- /watch pid <pid> - Watch a process",
+        "- /watch file <path> - Watch a file",
+        "- /watches - List active watches",
+        "- /remind <time> <message> - Set a reminder",
+        "",
+        "Available script aliases:",
+        scripts_info,
+        "",
+        live_context,
+    ]
+
+    if project_context:
+        sections.extend([
+            "",
+            "Project context file:",
+            project_context,
+        ])
+
+    sections.extend([
+        "",
+        "Instructions:",
+        "1. Analyse the user's request.",
+        "2. Map it to the single most appropriate Kira command.",
+        "3. Return ONLY a JSON object — no prose, no markdown fences.",
+        "",
+        "Response format (examples):",
+        '{"command": "/run", "args": ["crypto_train_explore", "--fee_mult", "10"]}',
+        '{"command": "/shell", "args": ["dir C:\\\\Users"]}',
+        '{"command": "/status", "args": []}',
+    ])
+
+    return _truncate_for_prompt("\n".join(sections), 24000)
+
+
+def _truncate_for_prompt(text: str, max_chars: int) -> str:
+    """Truncate prompt content while preserving a clear overflow marker."""
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n\n[...context truncated...]"
+
+
+def _build_ask_confirmation_text(command: str, args: list[str]) -> str:
+    """Format the confirmation message for a proposed Kira command."""
+    args_display = " ".join(args)
+    return f"Proposed command:\n`{command} {args_display}`\n\nExecute?"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -996,6 +1202,7 @@ async def handle_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "/paste — Get clipboard\n\n"
         "**Application Management**\n"
         "/list_apps — List running applications\n"
+        "/open <app> — Open an application by name\n"
         "/close_apps <app1> [app2] — Close applications\n\n"
         "**Power**\n"
         "/sleep — Sleep PC\n"
@@ -1094,6 +1301,38 @@ def _is_system_process(process_name: str, executable_path: str) -> bool:
     return False
 
 
+def _normalize_app_name(raw_name: str) -> str | None:
+    """Return a sanitized app name, or ``None`` if the value looks like a path."""
+    cleaned = raw_name.strip().strip('"').strip("'").strip()
+    if not cleaned:
+        return None
+    if any(sep in cleaned for sep in ("\\", "/", ":")):
+        return None
+    return cleaned
+
+
+def _open_app_by_name(app_name: str) -> str:
+    """Launch an application by its name only.
+
+    The command intentionally rejects path-like input so /open stays name-only.
+    """
+    normalized = _normalize_app_name(app_name)
+    if normalized is None:
+        return "Usage: /open <app name>\nExample: /open notepad"
+
+    try:
+        subprocess.Popen(
+            ["cmd", "/c", "start", "", normalized],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        logger.info("open: launched app by name %r", normalized)
+        return f"✅ Opening {normalized}..."
+    except Exception as exc:
+        logger.error("open: failed to launch %r: %s", normalized, exc, exc_info=True)
+        return f"❌ Failed to open {normalized}: {exc}"
+
+
 @require_auth
 async def handle_list_apps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/list_apps`` — list running installed applications."""
@@ -1130,6 +1369,18 @@ async def handle_list_apps(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lines.append("No user applications running.")
     
     await update.message.reply_text("\n".join(lines)[:4000])
+
+
+@require_auth
+async def handle_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/open <app>`` — open an application by name only."""
+    if not context.args:
+        await update.message.reply_text("Usage: /open <app name>\nExample: /open notepad")
+        return
+
+    app_name = " ".join(context.args)
+    result = _open_app_by_name(app_name)
+    await update.message.reply_text(result)
 
 
 @require_auth
@@ -1277,16 +1528,79 @@ def _decode_ask_cb(data: str) -> tuple[str, list[str]]:
         return "", []
 
 
+async def _ask_core(user_message: str) -> tuple[str, list[str]] | None:
+    """Call GPT-4o Mini to translate natural language into a (command, args) pair.
+
+    This is the shared brain behind both /ask and handle_voice. Extracting it
+    here means zero duplication — both entry points call this one function and
+    then present the result in their own way (text confirmation vs voice reply).
+
+    Returns:
+        (command, args) tuple on success, e.g. ("/run", ["crypto_train_full"])
+        None if the model response could not be parsed or was empty.
+
+    Raises:
+        RuntimeError: If OPENAI_API_KEY is not set.
+        openai.OpenAIError: On API errors.
+    """
+    from openai import AsyncOpenAI
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not set in .env")
+
+    client = AsyncOpenAI(api_key=api_key)
+    system_prompt = _build_ask_system_prompt()
+
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        temperature=0.1,
+        max_tokens=200,
+    )
+
+    result_text = response.choices[0].message.content.strip()
+
+    # Strip accidental markdown fences
+    result_text = re.sub(r"^```[a-z]*\n?", "", result_text)
+    result_text = re.sub(r"\n?```$", "", result_text)
+    result_text = result_text.strip()
+
+    try:
+        parsed = json.loads(result_text)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+            except json.JSONDecodeError:
+                logger.warning("_ask_core: unparseable response: %r", result_text)
+                return None
+        else:
+            logger.warning("_ask_core: no JSON found in response: %r", result_text)
+            return None
+
+    command = parsed.get("command", "").strip()
+    args = [str(a) for a in parsed.get("args", [])]
+
+    if not command:
+        return None
+
+    return command, args
+
+
 @require_auth
 async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Translate natural language to a Kira command using GPT-4o Mini."""
+    """``/ask <text>`` — translate natural language to a Kira command using GPT-4o Mini."""
     try:
-        from openai import AsyncOpenAI
+        from openai import AsyncOpenAI  # noqa: F401 — ensure package present
     except ImportError:
         await update.message.reply_text("Error: openai package not installed. Run: pip install openai")
         return
 
-    # Strip the "/ask " prefix to get only the user's natural language query
     raw_text = update.message.text or ""
     user_message = raw_text.split(" ", 1)[1].strip() if " " in raw_text else ""
 
@@ -1297,115 +1611,15 @@ async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("Thinking...")
 
     try:
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            await update.message.reply_text("Error: OPENAI_API_KEY not set in .env")
-            return
-
-        client = AsyncOpenAI(api_key=api_key)
-
-        scripts_info = "\n".join(
-            f"- {alias}: {cfg.get('path', 'N/A')}"
-            for alias, cfg in _SCRIPTS_CONFIG.items()
-        ) or "- (none configured)"
-
-        processes = process_registry.list_processes()
-        processes_info = "\n".join(
-            f"- PID {p['pid']}: {p['alias']} (running)"
-            for p in processes
-        ) if processes else "- No running processes"
-
-        system_prompt = f"""You are a command translator for a Telegram bot called Kira.
-Your job is to convert natural language requests into exact Kira commands.
-
-Available commands:
-- /run <alias> - Execute a script from scripts.toml
-- /run <alias> <args> - Execute with extra arguments
-- /shell <command> - Run a shell command
-- /status - List running processes
-- /kill <pid> - Kill a process
-- /schedule <alias> <time> - Schedule a script (e.g., 23:00, 30m, 2h)
-- /schedules - List pending schedules
-- /sysinfo - Show system info (CPU, RAM, GPU)
-- /screenshot - Take a screenshot
-- /ls [path] - List directory
-- /find <pattern> [path] - Find files
-- /tail <path> [n] - Show last lines of file
-- /copy <text> - Copy to clipboard
-- /paste - Get clipboard content
-- /sleep - Put PC to sleep
-- /shutdown <minutes> - Schedule shutdown
-- /reboot <minutes> - Schedule reboot
-- /watch pid <pid> - Watch a process
-- /watch file <path> - Watch a file
-- /watches - List active watches
-- /remind <time> <message> - Set a reminder
-
-Available script aliases:
-{scripts_info}
-
-Currently running processes:
-{processes_info}
-
-Instructions:
-1. Analyse the user's request.
-2. Map it to the single most appropriate Kira command.
-3. Return ONLY a JSON object — no prose, no markdown fences.
-
-Response format (examples):
-{{"command": "/run", "args": ["crypto_train_explore", "--fee_mult", "10"]}}
-{{"command": "/shell", "args": ["dir C:\\\\Users"]}}
-{{"command": "/status", "args": []}}"""
-
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.1,
-            max_tokens=200,
-        )
-
-        result_text = response.choices[0].message.content.strip()
-
-        # Remove accidental markdown code fences if the model adds them
-        result_text = re.sub(r"^```[a-z]*\n?", "", result_text)
-        result_text = re.sub(r"\n?```$", "", result_text)
-        result_text = result_text.strip()
-
-        try:
-            parsed = json.loads(result_text)
-        except json.JSONDecodeError:
-            # Try to extract a JSON object from free-form text
-            match = re.search(r'\{.*\}', result_text, re.DOTALL)
-            if match:
-                try:
-                    parsed = json.loads(match.group())
-                except json.JSONDecodeError:
-                    await update.message.reply_text(
-                        f"Could not parse model response:\n{result_text}"
-                    )
-                    return
-            else:
-                await update.message.reply_text(
-                    f"Could not parse model response:\n{result_text}"
-                )
-                return
-
-        command = parsed.get("command", "").strip()
-        args = [str(a) for a in parsed.get("args", [])]
-
-        if not command:
+        result = await _ask_core(user_message)
+        if result is None:
             await update.message.reply_text(
                 "Could not understand the request. Try being more specific."
             )
             return
 
-        args_display = " ".join(args)
-        confirmation_text = (
-            f"Proposed command:\n`{command} {args_display}`\n\nExecute?"
-        )
+        command, args = result
+        confirmation_text = _build_ask_confirmation_text(command, args)
 
         callback_data = _encode_ask_cb(command, args)
         keyboard = InlineKeyboardMarkup([
@@ -1424,6 +1638,127 @@ Response format (examples):
     except Exception as exc:
         logger.error("handle_ask error: %s", exc, exc_info=True)
         await update.message.reply_text(f"Error: {exc}")
+
+
+@require_auth
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle incoming Telegram voice messages.
+
+    Flow:
+      1. Download the .ogg voice file from Telegram.
+      2. Transcribe via OpenAI Whisper → plain text.
+      3. Pass transcript through _ask_core → (command, args).
+      4. Present an inline Yes/Cancel confirmation (same as /ask).
+      5. When the user confirms, the existing handle_ask_callback executes it
+         and Kira speaks the result back via OpenAI TTS.
+
+    Why confirmation even for voice?
+      Silent auto-execution from a voice command on a real machine is dangerous.
+      The confirm step takes one tap and prevents misheard commands from doing
+      something destructive. The confirmation message itself is also spoken back
+      so the user knows what Kira understood.
+    """
+    msg = update.message
+
+    # --- Step 1: Download the voice file ---
+    try:
+        tg_file = await msg.voice.get_file()
+        ogg_bytes = await tg_file.download_as_bytearray()
+    except Exception as exc:
+        logger.error("handle_voice: download failed: %s", exc)
+        await msg.reply_text("Failed to download voice message.")
+        return
+
+    # --- Step 2: Transcribe via Whisper ---
+    try:
+        transcript = await voice.transcribe(bytes(ogg_bytes))
+    except Exception as exc:
+        logger.error("handle_voice: transcription failed: %s", exc)
+        await msg.reply_text("Voice transcription failed. Try again.")
+        return
+
+    if not transcript:
+        await msg.reply_text("Couldn't make out what you said. Try again.")
+        return
+
+    logger.info(
+        "handle_voice: user %s said: %r", update.effective_user.id, transcript
+    )
+
+    # Echo the transcript so the user can verify what Kira heard.
+    await msg.reply_text(f"🎙️ Heard: _{transcript}_", parse_mode="Markdown")
+
+    # --- Step 3: Translate transcript → command via GPT-4o Mini ---
+    try:
+        result = await _ask_core(transcript)
+    except Exception as exc:
+        logger.error("handle_voice: _ask_core failed: %s", exc)
+        error_audio = await _safe_synthesise(f"Sorry, I ran into an error: {exc}")
+        if error_audio:
+            await _send_voice(msg, error_audio)
+        return
+
+    if result is None:
+        response_text = "I couldn't map that to a command. Could you rephrase?"
+        await msg.reply_text(response_text)
+        audio = await _safe_synthesise(response_text)
+        if audio:
+            await _send_voice(msg, audio)
+        return
+
+    command, args = result
+    args_display = " ".join(args)
+    confirmation_text = f"Proposed command:\n`{command} {args_display}`\n\nExecute?"
+
+    # --- Step 4: Speak the confirmation back ---
+    spoken_confirm = f"I'll run {command} {args_display}. Shall I proceed?"
+    audio = await _safe_synthesise(spoken_confirm)
+    if audio:
+        await _send_voice(msg, audio)
+
+    # --- Step 5: Show the standard inline keyboard confirmation ---
+    # From here the flow is identical to /ask — handle_ask_callback takes over.
+    callback_data = _encode_ask_cb(command, args)
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes", callback_data=callback_data),
+            InlineKeyboardButton("Cancel", callback_data="ask_cancel"),
+        ]
+    ])
+    await msg.reply_text(
+        confirmation_text,
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+
+
+# ── Voice helpers ─────────────────────────────────────────────────
+
+async def _safe_synthesise(text: str) -> bytes | None:
+    """Call voice.synthesise and return None on failure instead of raising.
+
+    TTS failure should never crash the handler — Kira falls back to text only.
+    """
+    try:
+        return await voice.synthesise(text)
+    except Exception as exc:
+        logger.warning("TTS synthesis failed (falling back to text): %s", exc)
+        return None
+
+
+async def _send_voice(msg, audio_bytes: bytes) -> None:
+    """Send MP3 bytes as a Telegram voice message.
+
+    Uses reply_voice so it appears inline in the conversation as a playable
+    audio bubble, not as a file download.
+    """
+    import io
+    bio = io.BytesIO(audio_bytes)
+    bio.name = "response.mp3"
+    try:
+        await msg.reply_voice(voice=bio)
+    except Exception as exc:
+        logger.warning("Failed to send voice reply: %s", exc)
 
 
 async def handle_ask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1468,6 +1803,12 @@ async def handle_ask_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await reply("Error: /schedule requires <alias> <time>.")
             return
         await _ask_exec_schedule(reply, args)
+
+    elif command == "/open":
+        if not args:
+            await reply("Error: /open requires an app name.")
+            return
+        await _ask_exec_open(reply, args)
 
     elif command == "/status":
         processes = process_registry.list_processes()
@@ -1675,6 +2016,12 @@ async def _ask_exec_shell(reply, args: list[str]) -> None:
                 await reply(chunk[:4000])
     except Exception as exc:
         await reply(f"Error: {exc}")
+
+
+async def _ask_exec_open(reply, args: list[str]) -> None:
+    """Open an application from an /ask callback using the name-only launcher."""
+    result = _open_app_by_name(" ".join(args))
+    await reply(result)
 
 
 async def _ask_exec_schedule(reply, args: list[str]) -> None:

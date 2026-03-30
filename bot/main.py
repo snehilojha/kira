@@ -17,6 +17,7 @@ from telegram.error import NetworkError, TimedOut
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from bot import handlers
+from bot import monitor
 from bot import notifier
 from bot.auth import load_allowed_users
 
@@ -113,7 +114,11 @@ def main() -> None:
     handlers.load_config()
 
     # 4. Build application
-    app = ApplicationBuilder().token(token).build()
+    async def _post_init(application) -> None:
+        """Start background tasks once the Telegram application is ready."""
+        application.create_task(monitor.start_monitor())
+
+    app = ApplicationBuilder().token(token).post_init(_post_init).build()
 
     # 5. Register command handlers
     command_map = {
@@ -136,6 +141,7 @@ def main() -> None:
         "move": handlers.handle_move,
         "copy": handlers.handle_copy,
         "paste": handlers.handle_paste,
+        "open": handlers.handle_open,
         "screenshot": handlers.handle_screenshot,
         "sleep": handlers.handle_sleep,
         "shutdown": handlers.handle_shutdown,
@@ -183,6 +189,16 @@ def main() -> None:
         MessageHandler(
             _media_filter & filters.CaptionRegex(r"(?i)^/putfile"),
             handlers.handle_putfile,
+        )
+    )
+
+    # 8b. Voice messages WITHOUT a /putfile caption → Kira voice interface.
+    # Intentionally narrow: VOICE only (not AUDIO), excluding /putfile captions
+    # so we don't intercept legitimate file saves sent as voice messages.
+    app.add_handler(
+        MessageHandler(
+            filters.VOICE & ~filters.CaptionRegex(r"(?i)^/putfile"),
+            handlers.handle_voice,
         )
     )
 
