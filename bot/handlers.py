@@ -259,6 +259,22 @@ async def _build_ask_system_prompt() -> str:
     live_context = _format_live_context()
     conversation_context = await _format_conversation_history()
 
+    # Observer machine context (optional — degrades gracefully if not ready)
+    observer_context = ""
+    try:
+        from bot import observer
+        observer_context = observer.get_current_context()
+    except Exception:
+        pass
+
+    # Session memory (optional — degrades gracefully)
+    session_context = ""
+    try:
+        from bot import memory
+        session_context = await memory.get_recent_sessions(3)
+    except Exception:
+        pass
+
     sections = [
         "You are a command translator for a Telegram bot called Kira.",
         "Your job is to convert natural language requests into exact Kira commands.",
@@ -292,6 +308,19 @@ async def _build_ask_system_prompt() -> str:
         "",
         live_context,
     ]
+
+    if observer_context:
+        sections.extend([
+            "",
+            "Machine awareness (auto-updated every 15 min):",
+            observer_context,
+        ])
+
+    if session_context:
+        sections.extend([
+            "",
+            session_context,
+        ])
 
     if conversation_context:
         sections.extend([
@@ -517,6 +546,31 @@ async def handle_kill(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ── Schedule commands ─────────────────────────────────────────────
 
+async def _scheduled_run_callback(alias: str) -> None:
+    """Module-level run callback used by scheduler.reload_from_db() on restart."""
+    script = _get_script(alias)
+    if script is None:
+        await notifier.send(f"❌ Scheduled run failed — alias {alias} not found in scripts.toml.")
+        return
+    timeout = script.get("timeout", _DEFAULT_TIMEOUT)
+    checkpoint = script.get("checkpoint_interval")
+    args = list(script.get("args", []))
+    gen = executor.run_command(
+        interpreter=script["interpreter"],
+        script_path=script["path"],
+        args=args,
+        timeout=timeout,
+        alias=alias,
+        checkpoint_interval=checkpoint,
+    )
+    output_lines = []
+    async for chunk in gen:
+        output_lines.append(chunk)
+    full_output = "\n".join(output_lines)
+    if full_output.strip():
+        await notifier.send(f"📋 Output from scheduled {alias}:\n{full_output[-3000:]}")
+
+
 @require_auth
 async def handle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/schedule <alias> <HH:MM|Xm|Xh>`` — queue a script for later."""
@@ -536,33 +590,7 @@ async def handle_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Invalid time. Use HH:MM, Xm, or Xh.")
         return
 
-    async def _run_scheduled(a: str) -> None:
-        """Callback invoked by the scheduler when the time arrives."""
-        script = _get_script(a)
-        if script is None:
-            await notifier.send(f"❌ Scheduled run failed — alias {a} not found.")
-            return
-        timeout = script.get("timeout", _DEFAULT_TIMEOUT)
-        checkpoint = script.get("checkpoint_interval")
-        args = list(script.get("args", []))
-        gen = executor.run_command(
-            interpreter=script["interpreter"],
-            script_path=script["path"],
-            args=args,
-            timeout=timeout,
-            alias=a,
-            checkpoint_interval=checkpoint,
-        )
-        # Consume the generator (output goes via notifier for scheduled runs)
-        output_lines = []
-        async for chunk in gen:
-            output_lines.append(chunk)
-        # Send final output summary
-        full_output = "\n".join(output_lines)
-        if full_output.strip():
-            await notifier.send(f"📋 Output from scheduled {a}:\n{full_output[-3000:]}")
-
-    sid = await scheduler.schedule(alias, run_at, _run_scheduled)
+    sid = await scheduler.schedule(alias, run_at, _scheduled_run_callback)
     await update.message.reply_text(f"✅ Scheduled {alias} at {run_at.strftime('%H:%M:%S')} (ID: {sid})")
 
 
@@ -1347,6 +1375,82 @@ async def handle_runs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lines.append("  ".join(parts))
 
     await update.message.reply_text("\n".join(lines)[:4000])
+
+
+# ── Memory: session summary & recall ─────────────────────────────
+
+@require_auth
+async def handle_summarise(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/summarise`` — generate and save a GPT summary of today's activity."""
+    from bot import memory
+    await update.message.reply_text("⏳ Summarising today's activity...")
+    try:
+        summary = await memory.summarise_today()
+        await update.message.reply_text(f"📋 Today's summary:\n\n{summary}")
+    except Exception as exc:
+        logger.error("handle_summarise failed: %s", exc)
+        await update.message.reply_text(f"❌ Summarisation failed: {exc}")
+
+
+@require_auth
+async def handle_recall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/recall <query>`` — ask a natural-language question over recent session history."""
+    from bot import memory, db
+
+    query = " ".join(context.args) if context.args else ""
+    if not query:
+        await update.message.reply_text("Usage: /recall <your question about past sessions>")
+        return
+
+    await update.message.reply_text("🔍 Searching session history...")
+
+    try:
+        rows = await db.get_recent_sessions(7)
+    except Exception as exc:
+        await update.message.reply_text(f"❌ Failed to fetch session history: {exc}")
+        return
+
+    if not rows:
+        await update.message.reply_text("No session history found yet. Run /summarise after some activity.")
+        return
+
+    # Build context block from stored summaries
+    session_block = "\n".join(
+        f"[{r.get('date', '?')}] {r.get('summary', '')}"
+        for r in rows
+    )
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        await update.message.reply_text("❌ OPENAI_API_KEY not set.")
+        return
+
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=api_key)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are answering questions about a developer's past work sessions. "
+                        "Answer concisely based only on the provided session summaries."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Session summaries:\n\n{session_block}\n\nQuestion: {query}",
+                },
+            ],
+            max_tokens=300,
+            temperature=0.3,
+        )
+        answer = response.choices[0].message.content.strip()
+        await update.message.reply_text(answer)
+    except Exception as exc:
+        logger.error("handle_recall GPT call failed: %s", exc)
+        await update.message.reply_text(f"❌ Recall failed: {exc}")
 
 
 # ── Help ──────────────────────────────────────────────────────────
@@ -2281,26 +2385,5 @@ async def _ask_exec_schedule(reply, args: list[str]) -> None:
         await reply("Invalid time format. Use HH:MM, Xm, or Xh.")
         return
 
-    async def _run_scheduled(a: str) -> None:
-        """Callback invoked by the scheduler when the time arrives."""
-        s = _get_script(a)
-        if s is None:
-            await notifier.send(f"Scheduled run failed — alias {a} not found.")
-            return
-        gen = executor.run_command(
-            interpreter=s["interpreter"],
-            script_path=s["path"],
-            args=list(s.get("args", [])),
-            timeout=s.get("timeout", _DEFAULT_TIMEOUT),
-            alias=a,
-            checkpoint_interval=s.get("checkpoint_interval"),
-        )
-        output_lines = []
-        async for chunk in gen:
-            output_lines.append(chunk)
-        full_output = "\n".join(output_lines)
-        if full_output.strip():
-            await notifier.send(f"Output from scheduled {a}:\n{full_output[-3000:]}")
-
-    sid = await scheduler.schedule(alias, target_time, _run_scheduled)
+    sid = await scheduler.schedule(alias, target_time, _scheduled_run_callback)
     await reply(f"Scheduled {alias} for {target_time.strftime('%H:%M')} (ID: {sid}).")

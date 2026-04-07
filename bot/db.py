@@ -104,6 +104,49 @@ CREATE TABLE IF NOT EXISTS reminders (
     message  TEXT    NOT NULL,
     fired    INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS sessions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    date        TEXT    NOT NULL,
+    summary     TEXT    NOT NULL,
+    raw_events  TEXT,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS schedules (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    alias       TEXT    NOT NULL,
+    run_at      TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    fired       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS watches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    type        TEXT    NOT NULL,
+    target      TEXT    NOT NULL,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    fired       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS observations (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    observed_at     TEXT    NOT NULL DEFAULT (datetime('now')),
+    active_projects TEXT,
+    recent_files    TEXT,
+    git_status      TEXT,
+    running_procs   TEXT,
+    screen_summary  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS world_snapshots (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    captured_at TEXT    NOT NULL DEFAULT (datetime('now')),
+    btc_price   REAL,
+    eth_price   REAL,
+    fear_greed  INTEGER,
+    top_news    TEXT
+);
 """
 
 
@@ -262,3 +305,216 @@ async def mark_reminder_fired(reminder_id: int) -> None:
         (reminder_id,),
     )
     await conn.commit()
+
+
+# ── Session helpers ───────────────────────────────────────────────
+
+async def save_session(date: str, summary: str, raw_events: str | None = None) -> int:
+    """Persist a GPT-generated daily session summary.
+
+    Args:
+        date: ISO date string (YYYY-MM-DD).
+        summary: GPT-generated paragraph summary.
+        raw_events: Optional JSON string of raw event data.
+
+    Returns:
+        The rowid of the new session entry.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "INSERT INTO sessions (date, summary, raw_events) VALUES (?, ?, ?)",
+        (date, summary, raw_events),
+    )
+    await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def get_recent_sessions(n: int = 7) -> list[dict[str, Any]]:
+    """Return the last *n* session summaries, newest first.
+
+    Returns:
+        List of dicts with keys: ``id``, ``date``, ``summary``, ``raw_events``, ``created_at``.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT id, date, summary, raw_events, created_at "
+        "FROM sessions ORDER BY id DESC LIMIT ?",
+        (n,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Schedule helpers ──────────────────────────────────────────────
+
+async def save_schedule(alias: str, run_at: str) -> int:
+    """Persist a scheduled run so it survives a bot restart.
+
+    Args:
+        alias: Script alias from scripts.toml.
+        run_at: ISO-format datetime string.
+
+    Returns:
+        The rowid of the new schedule entry.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "INSERT INTO schedules (alias, run_at) VALUES (?, ?)",
+        (alias, run_at),
+    )
+    await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def mark_schedule_fired(schedule_id: int) -> None:
+    """Mark a schedule as fired so it won't be reloaded on restart."""
+    conn = _get_conn()
+    await conn.execute(
+        "UPDATE schedules SET fired = 1 WHERE id = ?",
+        (schedule_id,),
+    )
+    await conn.commit()
+
+
+async def get_pending_schedules() -> list[dict[str, Any]]:
+    """Return all unfired schedules with a future run_at time.
+
+    Returns:
+        List of dicts with keys: ``id``, ``alias``, ``run_at``, ``created_at``.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT id, alias, run_at, created_at FROM schedules "
+        "WHERE fired = 0 AND run_at > datetime('now')",
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Watch helpers ─────────────────────────────────────────────────
+
+async def save_watch(watch_type: str, target: str) -> int:
+    """Persist a watchdog entry so it survives a bot restart.
+
+    Args:
+        watch_type: ``"pid"`` or ``"file"``.
+        target: PID as string, or file path.
+
+    Returns:
+        The rowid of the new watch entry.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "INSERT INTO watches (type, target) VALUES (?, ?)",
+        (watch_type, target),
+    )
+    await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def mark_watch_fired(watch_db_id: int) -> None:
+    """Mark a watch as fired so it won't be reloaded on restart."""
+    conn = _get_conn()
+    await conn.execute(
+        "UPDATE watches SET fired = 1 WHERE id = ?",
+        (watch_db_id,),
+    )
+    await conn.commit()
+
+
+async def get_pending_watches() -> list[dict[str, Any]]:
+    """Return all unfired watch entries.
+
+    Returns:
+        List of dicts with keys: ``id``, ``type``, ``target``, ``created_at``.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT id, type, target, created_at FROM watches WHERE fired = 0",
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Observation helpers ───────────────────────────────────────────
+
+async def save_observation(snapshot: dict[str, Any]) -> int:
+    """Persist an observer snapshot.
+
+    Args:
+        snapshot: Dict with optional keys: ``active_projects``, ``recent_files``,
+            ``git_status``, ``running_procs``, ``screen_summary``.
+
+    Returns:
+        The rowid of the new observation entry.
+    """
+    import json as _json
+
+    def _to_str(v: Any) -> str | None:
+        if v is None:
+            return None
+        return v if isinstance(v, str) else _json.dumps(v)
+
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "INSERT INTO observations "
+        "(active_projects, recent_files, git_status, running_procs, screen_summary) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            _to_str(snapshot.get("active_projects")),
+            _to_str(snapshot.get("recent_files")),
+            _to_str(snapshot.get("git_status")),
+            _to_str(snapshot.get("running_procs")),
+            _to_str(snapshot.get("screen_summary")),
+        ),
+    )
+    await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+# ── World snapshot helpers ────────────────────────────────────────
+
+async def save_world_snapshot(snapshot: dict[str, Any]) -> int:
+    """Persist a world data snapshot.
+
+    Args:
+        snapshot: Dict with optional keys: ``btc_price``, ``eth_price``,
+            ``fear_greed``, ``top_news``.
+
+    Returns:
+        The rowid of the new snapshot entry.
+    """
+    import json as _json
+
+    top_news = snapshot.get("top_news")
+    if top_news is not None and not isinstance(top_news, str):
+        top_news = _json.dumps(top_news)
+
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "INSERT INTO world_snapshots (btc_price, eth_price, fear_greed, top_news) "
+        "VALUES (?, ?, ?, ?)",
+        (
+            snapshot.get("btc_price"),
+            snapshot.get("eth_price"),
+            snapshot.get("fear_greed"),
+            top_news,
+        ),
+    )
+    await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def get_recent_world_snapshot() -> dict[str, Any] | None:
+    """Return the most recently captured world snapshot, or None.
+
+    Returns:
+        Dict with keys: ``id``, ``captured_at``, ``btc_price``, ``eth_price``,
+        ``fear_greed``, ``top_news``.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT * FROM world_snapshots ORDER BY id DESC LIMIT 1",
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None

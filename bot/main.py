@@ -18,8 +18,12 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 
 from bot import db
 from bot import handlers
+from bot import memory
 from bot import monitor
+from bot import observer
 from bot import notifier
+from bot import scheduler
+from bot import watchdog
 from bot.auth import load_allowed_users
 
 # ── Paths ─────────────────────────────────────────────────────────
@@ -119,7 +123,11 @@ def main() -> None:
         """Start background tasks once the Telegram application is ready."""
         await db.init_db()
         await handlers.reload_reminders()
+        await scheduler.reload_from_db(handlers._scheduled_run_callback)
+        await watchdog.reload_from_db()
         application.create_task(monitor.start_monitor())
+        application.create_task(memory.start_daily_summariser())
+        application.create_task(observer.start())
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
 
@@ -160,6 +168,8 @@ def main() -> None:
         "ask": handlers.handle_ask,
         "history": handlers.handle_history,
         "runs": handlers.handle_runs,
+        "summarise": handlers.handle_summarise,
+        "recall": handlers.handle_recall,
     }
 
     for name, handler in command_map.items():
