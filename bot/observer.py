@@ -27,21 +27,61 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from bot import provider
+
 logger = logging.getLogger(__name__)
 
-_OBSERVER_INTERVAL = int(os.environ.get("OBSERVER_INTERVAL", "40000")) 
+_OBSERVER_INTERVAL = int(os.environ.get("OBSERVER_INTERVAL", "40000"))
 _RECENT_FILE_HOURS = 48
 _MAX_FILES_PER_ROOT = 20
 _MAX_LOG_TAIL_LINES = 30
 _GPT_MODEL = "gpt-4o-mini"
 
-# Module-level cached context string
+# Seconds with no new log output before a process is considered potentially stalled.
+_STALL_THRESHOLD_SECONDS = float(os.environ.get("KIRA_STALL_THRESHOLD_SECONDS", "300"))
+
+# Module-level cached context string and raw snapshot.
 _CURRENT_CONTEXT_SUMMARY: str = ""
+_raw_snapshot_cache: dict = {}
 
 
 def get_current_context() -> str:
     """Return the latest GPT-summarised machine context, or empty string if not ready."""
     return _CURRENT_CONTEXT_SUMMARY
+
+
+def get_pending_triggers() -> list[str]:
+    """Return screen-vision trigger types that are currently active.
+
+    Inspects the cached raw snapshot for ambiguity conditions. Called by the
+    observer after each cycle to decide whether to fire screen_vision.
+
+    Returns:
+        List of TriggerType strings (may be empty).
+    """
+    triggers: list[str] = []
+    snapshot = _raw_snapshot_cache
+
+    if not snapshot:
+        return triggers
+
+    dialog = snapshot.get("dialog_detected")
+    if dialog:
+        triggers.append("dialog_appeared")
+
+    stalled = snapshot.get("stalled_processes", [])
+    for proc in stalled:
+        label = proc.get("alias", "")
+        if "cursor" in label.lower():
+            triggers.append("cursor_ai_stalled")
+        else:
+            triggers.append("process_frozen")
+
+    stdin_blocked = snapshot.get("stdin_blocked_processes", [])
+    if stdin_blocked:
+        triggers.append("stdin_silent")
+
+    return triggers
 
 
 async def start() -> None:
@@ -61,10 +101,11 @@ async def start() -> None:
 
 
 async def _run_cycle() -> None:
-    """Collect a snapshot, persist it, and update the cached summary."""
-    global _CURRENT_CONTEXT_SUMMARY
+    """Collect a snapshot, persist it, update the cached summary, dispatch triggers."""
+    global _CURRENT_CONTEXT_SUMMARY, _raw_snapshot_cache
 
     snapshot = await asyncio.to_thread(_collect_snapshot)
+    _raw_snapshot_cache = snapshot
 
     try:
         from bot import db
@@ -75,6 +116,8 @@ async def _run_cycle() -> None:
     summary = await _summarise_snapshot(snapshot)
     _CURRENT_CONTEXT_SUMMARY = summary
     logger.debug("Observer context updated (%d chars)", len(summary))
+
+    await _dispatch_triggers()
 
 
 # ── Snapshot collection ───────────────────────────────────────────
@@ -87,6 +130,10 @@ def _collect_snapshot() -> dict[str, Any]:
     git_statuses = _collect_git_statuses(project_roots)
     running_procs = _collect_running_procs()
     log_tails = _collect_log_tails()
+    foreground_window = _collect_foreground_window()
+    dialog_detected = _collect_dialog_state()
+    stalled_processes = _check_process_stall_state(running_procs)
+    stdin_blocked = _check_stdin_blocked(running_procs)
 
     return {
         "observed_at": datetime.now().isoformat(timespec="seconds"),
@@ -95,6 +142,11 @@ def _collect_snapshot() -> dict[str, Any]:
         "git_status": _format_git_statuses(git_statuses),
         "running_procs": _format_running_procs(running_procs),
         "screen_summary": _format_log_tails(log_tails),
+        # V1.5 additions
+        "foreground_window": foreground_window,
+        "dialog_detected": dialog_detected,
+        "stalled_processes": stalled_processes,
+        "stdin_blocked_processes": stdin_blocked,
     }
 
 
@@ -231,6 +283,196 @@ def _collect_log_tails() -> dict[str, str]:
     return tails
 
 
+# ── V1.5 awareness collectors ─────────────────────────────────────
+
+def _collect_foreground_window() -> str:
+    """Return the title of the currently focused window (Windows only).
+
+    Uses ctypes ``GetForegroundWindow`` + ``GetWindowTextW``. Returns empty
+    string on non-Windows or if the call fails.
+    """
+    import platform
+    import ctypes
+
+    if platform.system() != "Windows":
+        return ""
+
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()  # type: ignore[attr-defined]
+        if not hwnd:
+            return ""
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)  # type: ignore[attr-defined]
+        if length == 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)  # type: ignore[attr-defined]
+        return buf.value.strip()
+    except Exception as exc:
+        logger.debug("GetForegroundWindow failed: %s", exc)
+        return ""
+
+
+def _collect_dialog_state() -> str | None:
+    """Detect the presence of a modal dialog or UAC prompt (Windows only).
+
+    Enumerates top-level windows looking for the Windows dialog class
+    ``#32770`` (common for message boxes and UAC prompts) and other known
+    modal class names. Returns a short description or None.
+    """
+    import platform
+    import ctypes
+
+    if platform.system() != "Windows":
+        return None
+
+    found_dialogs: list[str] = []
+
+    _DIALOG_CLASSES = {"#32770", "ApplicationFrameWindow"}
+
+    try:
+        def _enum_callback(hwnd, _):
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):  # type: ignore[attr-defined]
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)  # type: ignore[attr-defined]
+            cls = buf.value.strip()
+            if cls in _DIALOG_CLASSES:
+                title_buf = ctypes.create_unicode_buffer(256)
+                ctypes.windll.user32.GetWindowTextW(hwnd, title_buf, 256)  # type: ignore[attr-defined]
+                title = title_buf.value.strip()
+                if title:
+                    found_dialogs.append(f"{cls}: {title}")
+            return True
+
+        _EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)  # type: ignore[attr-defined]
+        ctypes.windll.user32.EnumWindows(_EnumWindowsProc(_enum_callback), 0)  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.debug("EnumWindows failed: %s", exc)
+        return None
+
+    if found_dialogs:
+        return "; ".join(found_dialogs)
+    return None
+
+
+def _check_process_stall_state(running_procs: list[dict]) -> list[dict]:
+    """Return processes that appear stalled (running too long with no log output).
+
+    A process is considered stalled if:
+    - It has been running for more than _STALL_THRESHOLD_SECONDS, AND
+    - Its log file has not been modified in the last _STALL_THRESHOLD_SECONDS.
+
+    Args:
+        running_procs: List of process dicts from process_registry.
+
+    Returns:
+        List of stalled process dicts (subset of running_procs).
+    """
+    import time
+
+    stalled: list[dict] = []
+    now = time.time()
+
+    for proc in running_procs:
+        # Skip processes that have already exited.
+        if proc.get("returncode") is not None:
+            continue
+
+        runtime = proc.get("runtime_seconds", 0) or 0
+        if runtime < _STALL_THRESHOLD_SECONDS:
+            continue
+
+        log_path = proc.get("log_path")
+        if not log_path:
+            continue
+
+        try:
+            mtime = Path(log_path).stat().st_mtime
+            log_age = now - mtime
+            if log_age >= _STALL_THRESHOLD_SECONDS:
+                stalled.append({
+                    "alias": proc.get("alias", "unknown"),
+                    "pid": proc.get("pid"),
+                    "runtime_seconds": runtime,
+                    "log_idle_seconds": log_age,
+                })
+        except OSError:
+            pass
+
+    return stalled
+
+
+def _check_stdin_blocked(running_procs: list[dict]) -> list[dict]:
+    """Detect Kira-launched processes that may be blocked waiting for stdin.
+
+    Uses psutil to check whether a process is in the 'stopped' state or
+    has an open stdin pipe with no recent stdout. This is a best-effort
+    heuristic — false positives are tolerable since screen_vision will
+    confirm before notifying.
+
+    Args:
+        running_procs: List of process dicts from process_registry.
+
+    Returns:
+        List of possibly-blocked process dicts.
+    """
+    blocked: list[dict] = []
+
+    try:
+        import psutil
+    except ImportError:
+        return blocked
+
+    for proc in running_procs:
+        if proc.get("returncode") is not None:
+            continue
+        pid = proc.get("pid")
+        if not pid:
+            continue
+        try:
+            ps = psutil.Process(pid)
+            status = ps.status()
+            if status in (psutil.STATUS_STOPPED, "stopped"):
+                blocked.append({
+                    "alias": proc.get("alias", "unknown"),
+                    "pid": pid,
+                    "status": status,
+                })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    return blocked
+
+
+async def _dispatch_triggers() -> None:
+    """Fire screen-vision checks for any active ambiguity triggers."""
+    triggers = get_pending_triggers()
+    if not triggers:
+        return
+
+    from bot import screen_vision
+
+    snapshot = _raw_snapshot_cache
+
+    for trigger in triggers:
+        process_label = ""
+        if trigger in ("process_frozen", "cursor_ai_stalled"):
+            stalled = snapshot.get("stalled_processes", [])
+            if stalled:
+                process_label = stalled[0].get("alias", "")
+        elif trigger == "stdin_silent":
+            blocked = snapshot.get("stdin_blocked_processes", [])
+            if blocked:
+                process_label = blocked[0].get("alias", "")
+        elif trigger == "dialog_appeared":
+            process_label = snapshot.get("dialog_detected", "") or ""
+
+        try:
+            await screen_vision.notify_if_actionable(trigger, process_label)
+        except Exception as exc:
+            logger.warning("Screen vision dispatch failed for %s: %s", trigger, exc)
+
+
 # ── Formatters ────────────────────────────────────────────────────
 
 def _format_recent_files(data: dict[str, list[str]]) -> str:
@@ -294,16 +536,9 @@ async def _summarise_snapshot(snapshot: dict[str, Any]) -> str:
         snapshot.get("screen_summary", ""),
     ]))
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return raw_text
-
     try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=api_key)
-
-        response = await client.chat.completions.create(
-            model=_GPT_MODEL,
+        response = await provider.create_chat_completion(
+            role="fast",
             messages=[
                 {
                     "role": "system",
@@ -325,6 +560,8 @@ async def _summarise_snapshot(snapshot: dict[str, Any]) -> str:
 
         return response.choices[0].message.content.strip()
 
+    except RuntimeError:
+        return raw_text
     except Exception as exc:
         logger.warning("Observer GPT summarisation failed, using raw snapshot: %s", exc)
         return raw_text

@@ -171,6 +171,18 @@ class AskContextTests(unittest.TestCase):
         text = handlers._build_ask_confirmation_text("/run", ["crypto_train_full", "--fee_mult", "10"])
         self.assertEqual(text, "Proposed command:\n`/run crypto_train_full --fee_mult 10`\n\nExecute?")
 
+    def test_build_route_stub_text_for_complex_route(self) -> None:
+        """Complex routes should produce a clear temporary stub message."""
+        decision = handlers.router.RoutingDecision(
+            route="complex",
+            source="rule",
+            confidence=0.88,
+            reason="Contains a multi-step signal.",
+        )
+        text = handlers._build_route_stub_text(decision)
+        self.assertIn("Complex route selected", text)
+        self.assertIn("not wired in yet", text)
+
     def test_normalize_app_name_rejects_path_like_input(self) -> None:
         """Path-like values should be rejected because /open is app-name only."""
         self.assertEqual(handlers._normalize_app_name("  notepad  "), "notepad")
@@ -226,6 +238,193 @@ class AskContextTests(unittest.TestCase):
         open_mock.assert_called_once_with("notepad")
         self.assertIn("Executing: `/open notepad`", replies[0])
         self.assertIn("✅ Opening notepad...", replies[-1])
+
+    def test_handle_ask_callback_resolves_brain_approval(self) -> None:
+        """Brain approval callbacks should resolve the pending approval future."""
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        future = loop.create_future()
+        handlers._PENDING_BRAIN_APPROVALS["approval-1"] = future
+        replies: list[str] = []
+
+        class _FakeMessage:
+            async def reply_text(self, text: str, **kwargs):
+                replies.append(text)
+
+        class _FakeQuery:
+            data = "brain_yes|approval-1"
+            message = _FakeMessage()
+
+            async def answer(self):
+                return None
+
+            async def edit_message_text(self, text: str, **kwargs):
+                replies.append(text)
+
+        update = types.SimpleNamespace(callback_query=_FakeQuery())
+        context = types.SimpleNamespace()
+
+        try:
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(handlers.handle_ask_callback(update, context))
+        finally:
+            asyncio.set_event_loop(None)
+            handlers._PENDING_BRAIN_APPROVALS.pop("approval-1", None)
+
+        self.assertTrue(future.done())
+        self.assertTrue(future.result())
+        self.assertEqual(replies[-1], "Approved complex-task action.")
+
+    def test_task_state_formatters_show_pending_approval(self) -> None:
+        """Task details should expose pending approval context after interruption."""
+        state = {
+            "task_id": "task-123",
+            "status": "interrupted",
+            "stage": "interrupted",
+            "updated_at": "2026-04-16T12:00:00+00:00",
+            "last_message": "Kira restarted.",
+            "task_request": {
+                "source": "telegram",
+                "route": "complex",
+                "user_input": "run crypto eval",
+            },
+            "pending_approval": {
+                "request_id": "approval-1",
+                "tool_name": "registered_script_run",
+                "reason": "needs user confirmation",
+                "tool_input": {"alias": "crypto_eval"},
+            },
+            "tool_events": [
+                {
+                    "type": "tool_result",
+                    "tool_name": "test_command_run",
+                    "is_error": False,
+                    "output_tail": "Check unit_brain passed.\nRan 7 tests\nOK",
+                }
+            ],
+        }
+
+        summary = handlers._format_task_state_summary(state)
+        detail = handlers._format_task_state_detail(state)
+
+        self.assertIn("task-123 | interrupted/interrupted", summary)
+        self.assertIn("Pending approval at interruption", detail)
+        self.assertIn("registered_script_run", detail)
+        self.assertIn("Verification checks", detail)
+        self.assertIn("Check unit_brain passed", detail)
+
+    def test_handle_ask_simple_route_keeps_confirmation_flow(self) -> None:
+        """Simple routed asks should still produce the existing confirmation prompt."""
+
+        replies: list[tuple[str, dict]] = []
+
+        class _FakeMessage:
+            text = "/ask open notepad"
+
+            async def reply_text(self, text: str, **kwargs):
+                replies.append((text, kwargs))
+
+        update = types.SimpleNamespace(
+            message=_FakeMessage(),
+            effective_user=types.SimpleNamespace(id=123),
+        )
+        context = types.SimpleNamespace()
+        decision = handlers.router.RoutingDecision(
+            route="simple",
+            source="rule",
+            confidence=0.9,
+            reason="Matches an obvious single-action request.",
+        )
+
+        with patch.object(handlers.db, "log_conversation", new=AsyncMock()), patch.object(
+            handlers.router,
+            "classify_request",
+            new=AsyncMock(return_value=decision),
+        ), patch.object(
+            handlers,
+            "_ask_core",
+            new=AsyncMock(return_value=("/open", ["notepad"])),
+        ), patch("bot.auth.ALLOWED_USER_IDS", {123}):
+            asyncio.run(handlers.handle_ask(update, context))
+
+        self.assertEqual(replies[0][0], "Thinking...")
+        self.assertIn("Proposed command:", replies[-1][0])
+
+    def test_handle_ask_complex_route_calls_brain(self) -> None:
+        """Complex routed asks should execute through the new brain path."""
+
+        replies: list[tuple[str, dict]] = []
+
+        class _FakeMessage:
+            text = "/ask review my code and fix the bug"
+
+            async def reply_text(self, text: str, **kwargs):
+                replies.append((text, kwargs))
+
+        update = types.SimpleNamespace(
+            message=_FakeMessage(),
+            effective_user=types.SimpleNamespace(id=123),
+        )
+        context = types.SimpleNamespace()
+        decision = handlers.router.RoutingDecision(
+            route="complex",
+            source="rule",
+            confidence=0.88,
+            reason="Contains a multi-step signal.",
+        )
+        brain_result = handlers.brain.BrainResult(
+            task_id="task-123",
+            status="completed",
+            summary="Complex analysis result.",
+        )
+
+        async def _fake_stream(_task_request, approval_callback=None):
+            yield handlers.brain.BrainEvent(
+                task_id="task-123",
+                event_type="status",
+                message="Complex analysis started. Preparing task context...",
+                stage="queued",
+            )
+            yield handlers.brain.BrainEvent(
+                task_id="task-123",
+                event_type="tool",
+                message="Scanning the project files with glob pattern `**/*.py`...",
+                stage="tool_running",
+            )
+            yield handlers.brain.BrainEvent(
+                task_id="task-123",
+                event_type="result",
+                message="Complex analysis result.",
+                stage="completed",
+                result=brain_result,
+            )
+
+        with patch.object(handlers.db, "log_conversation", new=AsyncMock()), patch.object(
+            handlers.router,
+            "classify_request",
+            new=AsyncMock(return_value=decision),
+        ), patch.object(
+            handlers,
+            "_ask_core",
+            new=AsyncMock(),
+        ) as ask_core_mock, patch.object(
+            handlers.brain,
+            "build_task_request",
+            return_value=types.SimpleNamespace(task_id="task-123"),
+        ) as build_request_mock, patch.object(
+            handlers.brain,
+            "run_complex_task_stream",
+            side_effect=_fake_stream,
+        ) as run_complex_mock, patch("bot.auth.ALLOWED_USER_IDS", {123}):
+            asyncio.run(handlers.handle_ask(update, context))
+
+        ask_core_mock.assert_not_awaited()
+        build_request_mock.assert_called_once()
+        run_complex_mock.assert_called_once()
+        self.assertEqual(replies[0][0], "Thinking...")
+        self.assertEqual(replies[1][0], "Complex analysis started. Preparing task context...")
+        self.assertIn("glob pattern", replies[2][0])
+        self.assertEqual(replies[-1][0], "Complex analysis result.")
 
 
 if __name__ == "__main__":

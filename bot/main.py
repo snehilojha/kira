@@ -18,11 +18,14 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 
 from bot import db
 from bot import handlers
+from bot import job_monitor
 from bot import memory
+from bot import mode
 from bot import monitor
 from bot import observer
 from bot import notifier
 from bot import scheduler
+from bot import task_state
 from bot import watchdog
 from bot.auth import load_allowed_users
 
@@ -125,9 +128,21 @@ def main() -> None:
         await handlers.reload_reminders()
         await scheduler.reload_from_db(handlers._scheduled_run_callback)
         await watchdog.reload_from_db()
+        await job_monitor.reload_from_db()
+        interrupted = task_state.mark_interrupted_tasks(
+            "Bot restarted before the task reached a terminal state."
+        )
+        if interrupted:
+            await notifier.send(
+                "Kira restarted with unfinished complex task(s). "
+                f"Marked {len(interrupted)} task(s) as interrupted; no actions were replayed. "
+                "Use /tasks to inspect them."
+            )
         application.create_task(monitor.start_monitor())
         application.create_task(memory.start_daily_summariser())
         application.create_task(observer.start())
+        application.create_task(job_monitor.start())
+        application.create_task(mode.start())
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
 
@@ -166,10 +181,17 @@ def main() -> None:
         "close_apps": handlers.handle_close_apps,
         "help": handlers.handle_help,
         "ask": handlers.handle_ask,
+        "tasks": handlers.handle_tasks,
+        "task": handlers.handle_task,
         "history": handlers.handle_history,
         "runs": handlers.handle_runs,
         "summarise": handlers.handle_summarise,
         "recall": handlers.handle_recall,
+        "jobs": handlers.handle_jobs,
+        "canceljob": handlers.handle_cancel_job,
+        "pausejob": handlers.handle_pause_job,
+        "resumejob": handlers.handle_resume_job,
+        "mode": handlers.handle_mode,
     }
 
     for name, handler in command_map.items():
@@ -184,7 +206,7 @@ def main() -> None:
         query = update.callback_query
         data = query.data or ""
         
-        if data.startswith("ask_"):
+        if data.startswith("ask_") or data.startswith("brain_"):
             await handlers.handle_ask_callback(update, context)
         else:
             await handlers.handle_callback_query(update, context)

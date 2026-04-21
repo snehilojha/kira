@@ -147,6 +147,40 @@ CREATE TABLE IF NOT EXISTS world_snapshots (
     fear_greed  INTEGER,
     top_news    TEXT
 );
+
+CREATE TABLE IF NOT EXISTS monitor_jobs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id                TEXT    NOT NULL UNIQUE,
+    name                  TEXT    NOT NULL,
+    subject               TEXT    NOT NULL,
+    condition             TEXT    NOT NULL,
+    poll_interval_seconds REAL    NOT NULL,
+    success_action        TEXT    NOT NULL,
+    failure_action        TEXT,
+    expiry_at             TEXT,
+    requires_model        TEXT    NOT NULL DEFAULT 'fast',
+    cooldown_seconds      REAL    NOT NULL DEFAULT 300,
+    status                TEXT    NOT NULL DEFAULT 'active',
+    created_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+    last_fired_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mode_transitions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_mode   TEXT,
+    to_mode     TEXT    NOT NULL,
+    reason      TEXT,
+    occurred_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS vision_triggers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger_type    TEXT    NOT NULL,
+    process_label   TEXT,
+    interpretation  TEXT,
+    notified        INTEGER NOT NULL DEFAULT 0,
+    occurred_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -518,3 +552,183 @@ async def get_recent_world_snapshot() -> dict[str, Any] | None:
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+# ── Monitor job helpers ───────────────────────────────────────────
+
+async def save_monitor_job(job: dict[str, Any]) -> int:
+    """Persist a new monitor job.
+
+    Args:
+        job: Dict with keys matching the monitor_jobs table columns.
+
+    Returns:
+        The rowid of the new entry.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "INSERT INTO monitor_jobs "
+        "(job_id, name, subject, condition, poll_interval_seconds, "
+        " success_action, failure_action, expiry_at, requires_model, "
+        " cooldown_seconds, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            job["job_id"],
+            job["name"],
+            job["subject"],
+            job["condition"],
+            job["poll_interval_seconds"],
+            job["success_action"],
+            job.get("failure_action"),
+            job.get("expiry_at"),
+            job.get("requires_model", "fast"),
+            job.get("cooldown_seconds", 300.0),
+            job.get("status", "active"),
+        ),
+    )
+    await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def get_active_monitor_jobs() -> list[dict[str, Any]]:
+    """Return all monitor jobs with status 'active' or 'paused'.
+
+    Returns:
+        List of dicts with all monitor_jobs columns.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT * FROM monitor_jobs WHERE status IN ('active', 'paused') "
+        "ORDER BY id ASC",
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_all_monitor_jobs() -> list[dict[str, Any]]:
+    """Return all monitor jobs regardless of status.
+
+    Returns:
+        List of dicts with all monitor_jobs columns, newest first.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT * FROM monitor_jobs ORDER BY id DESC",
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def update_monitor_job_status(job_id: str, status: str) -> None:
+    """Update the status of a monitor job.
+
+    Args:
+        job_id: The unique job identifier.
+        status: One of ``'active'``, ``'paused'``, ``'cancelled'``, ``'expired'``, ``'fired'``.
+    """
+    conn = _get_conn()
+    await conn.execute(
+        "UPDATE monitor_jobs SET status = ? WHERE job_id = ?",
+        (status, job_id),
+    )
+    await conn.commit()
+
+
+async def update_monitor_job_last_fired(job_id: str, fired_at: str) -> None:
+    """Record when a monitor job last sent a notification.
+
+    Args:
+        job_id: The unique job identifier.
+        fired_at: ISO timestamp of the firing event.
+    """
+    conn = _get_conn()
+    await conn.execute(
+        "UPDATE monitor_jobs SET last_fired_at = ? WHERE job_id = ?",
+        (fired_at, job_id),
+    )
+    await conn.commit()
+
+
+# ── Mode transition helpers ───────────────────────────────────────
+
+async def log_mode_transition(
+    from_mode: str | None,
+    to_mode: str,
+    reason: str = "",
+) -> None:
+    """Persist one mode transition event.
+
+    Args:
+        from_mode: The previous mode, or None if this is the initial state.
+        to_mode: The new mode name.
+        reason: Short human-readable explanation for the transition.
+    """
+    conn = _get_conn()
+    await conn.execute(
+        "INSERT INTO mode_transitions (from_mode, to_mode, reason) VALUES (?, ?, ?)",
+        (from_mode, to_mode, reason),
+    )
+    await conn.commit()
+
+
+async def get_recent_mode_transitions(limit: int = 20) -> list[dict[str, Any]]:
+    """Return the most recent mode transitions, newest first.
+
+    Returns:
+        List of dicts with keys: ``id``, ``from_mode``, ``to_mode``,
+        ``reason``, ``occurred_at``.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT id, from_mode, to_mode, reason, occurred_at "
+        "FROM mode_transitions ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Vision trigger helpers ────────────────────────────────────────
+
+async def log_vision_trigger(
+    trigger_type: str,
+    process_label: str = "",
+    interpretation: str = "",
+    notified: bool = False,
+) -> int:
+    """Persist a screen-vision trigger event.
+
+    Args:
+        trigger_type: One of the four TriggerType literals.
+        process_label: Process or context that caused the trigger.
+        interpretation: Vision model's interpretation of the screenshot.
+        notified: Whether a Telegram notification was sent.
+
+    Returns:
+        The rowid of the new entry.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "INSERT INTO vision_triggers (trigger_type, process_label, interpretation, notified) "
+        "VALUES (?, ?, ?, ?)",
+        (trigger_type, process_label or "", interpretation or "", 1 if notified else 0),
+    )
+    await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def get_recent_vision_triggers(limit: int = 10) -> list[dict[str, Any]]:
+    """Return the most recent vision trigger events, newest first.
+
+    Returns:
+        List of dicts with keys: ``id``, ``trigger_type``, ``process_label``,
+        ``interpretation``, ``notified``, ``occurred_at``.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT id, trigger_type, process_label, interpretation, notified, occurred_at "
+        "FROM vision_triggers ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]

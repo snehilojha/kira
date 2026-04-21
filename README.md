@@ -51,9 +51,12 @@ Optional fields:
 python -m bot.main
 ```
 
-### 5. (Optional) Register as Windows service
+### 5. (Optional) Register as Windows startup tasks
 
 Right-click `autostart/setup_task_scheduler.ps1` → **Run with PowerShell as Administrator**.
+
+For Kira Local Voice, right-click `autostart/setup_local_voice_task.ps1` -> **Run with PowerShell**.
+This starts local voice after you log in, because global hotkeys, microphone, and speakers need your desktop session.
 
 ### 6. (Optional) Start MCP server for Windsurf
 
@@ -94,6 +97,32 @@ uvicorn mcp.server:app --host 127.0.0.1 --port 8000
 | `/unwatch <id>` | Remove watcher |
 | `/remind <Xm\|Xh> <msg>` | Set a reminder |
 | `/help` | Show all commands |
+
+## Local PC Voice
+
+Kira can also run as a local push-to-talk voice process, separate from the
+Telegram bot:
+
+```bash
+python -m bot.local_voice
+```
+
+By default, press `Ctrl+Alt+K`, speak for the configured recording window, and Kira will
+transcribe the audio, execute safe local app/mode commands, and speak back
+through the PC speakers. Configure known apps and modes in
+`config/apps.toml`.
+
+Useful environment overrides:
+
+```env
+KIRA_LOCAL_VOICE_RECORD_SECONDS=5
+KIRA_LOCAL_VOICE_SAMPLE_RATE=16000
+KIRA_LOCAL_VOICE_TRIGGER=hotkey
+KIRA_LOCAL_VOICE_HOTKEY=ctrl+alt+k
+```
+
+Set `KIRA_LOCAL_VOICE_TRIGGER=enter` to use the terminal Enter prompt instead
+of a global hotkey.
 
 ## Architecture
 
