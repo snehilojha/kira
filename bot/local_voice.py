@@ -34,6 +34,7 @@ from bot import overlay
 from bot import provider
 from bot import screen_vision
 from bot import voice
+from bot import wake_word as wake_word_mod
 
 logger = logging.getLogger(__name__)
 
@@ -313,28 +314,63 @@ def _is_multistep(text: str) -> bool:
     return any(signal in normalized for signal in _MULTISTEP_SIGNALS)
 
 
+# Conversational phrases that Kira answers instantly — no filler needed
+_CONVERSATIONAL = {
+    "how are you", "how are you doing", "what's up", "whats up",
+    "hey", "hello", "hi", "yo", "sup",
+    "who are you", "what are you", "introduce yourself",
+    "who am i", "what do you know about me",
+    "good morning", "good afternoon", "good evening", "good night",
+    "thanks", "thank you", "cheers", "cool", "okay", "ok",
+}
+
+# Prefixes that signal a slow external lookup is needed
+_SEARCH_PREFIXES = (
+    "search", "look up", "look up", "find out", "google",
+    "what's the latest", "what is the latest", "any news",
+    "what's happening", "what is happening",
+)
+
+
 def _pick_filler(transcript: str) -> str:
-    """Return a short spoken filler for queries that need processing time, or empty string for instant commands."""
+    """Return a filler only when processing will take noticeable time.
+
+    Screen captures, web searches, and multi-step commands get a filler.
+    Conversational replies and instant desktop commands get nothing.
+    """
     normalized = _normalize_text(transcript)
 
-    # Instant commands — no filler, they respond in under a second
+    # Conversational — Kira knows these instantly
+    if normalized in _CONVERSATIONAL:
+        return ""
+
+    # Desktop commands — instant
     instant_prefixes = ("open ", "close ", "press ", "click", "scroll", "type ", "volume", "play pause", "mute")
     if any(normalized.startswith(p) for p in instant_prefixes):
         return ""
     if normalized in {"status", "system status", "sysinfo", "system info"}:
         return ""
 
-    # Screen queries
+    # Screen queries — need a screenshot + vision call
     if _is_screen_query(transcript):
         return "Let me take a look."
 
-    # Multi-step actions
+    # Multi-step actions — involve several sequential steps
     if _is_multistep(transcript):
         return "On it."
 
-    # General knowledge / brain queries
-    question_words = ("what", "who", "when", "where", "why", "how", "is ", "are ", "can ", "will ", "tell me", "search")
-    if any(normalized.startswith(w) for w in question_words):
+    # Explicit search / lookup requests
+    if any(normalized.startswith(p) for p in _SEARCH_PREFIXES):
+        return "On it."
+
+    # Everything else goes to the LLM — only filler if it looks like
+    # a factual/current-data query, not a conversational one.
+    factual_prefixes = (
+        "what's the", "what is the", "who is", "who was", "when did",
+        "when is", "where is", "where was", "how much", "how many",
+        "how long", "what happened", "tell me about", "explain",
+    )
+    if any(normalized.startswith(p) for p in factual_prefixes):
         return "Let me check."
 
     return ""
@@ -797,12 +833,26 @@ async def run_loop() -> None:
     hotkey = os.environ.get("KIRA_LOCAL_VOICE_HOTKEY", _DEFAULT_HOTKEY).strip() or _DEFAULT_HOTKEY
     config = app_control.load_apps_config()
 
+    wake_word_name = os.environ.get("KIRA_WAKE_WORD", "hey_jarvis").strip()
+    wake_word_threshold = float(os.environ.get("KIRA_WAKE_WORD_THRESHOLD", "0.5"))
+
     await db.init_db()
     overlay.start()
     print("Kira local voice is ready.")
     logger.info("Kira local voice is ready")
+
     if trigger == "enter":
         await _run_enter_loop(record_seconds=record_seconds, sample_rate=sample_rate, config=config)
+        return
+
+    if trigger == "wake_word":
+        await _run_wake_word_loop(
+            wake_word=wake_word_name,
+            threshold=wake_word_threshold,
+            record_seconds=record_seconds,
+            sample_rate=sample_rate,
+            config=config,
+        )
         return
 
     await _run_hotkey_loop(
@@ -881,6 +931,44 @@ async def _run_hotkey_loop(
             keyboard.remove_hotkey(hotkey)
         except Exception:
             pass
+
+
+async def _run_wake_word_loop(
+    *,
+    wake_word: str,
+    threshold: float,
+    record_seconds: float,
+    sample_rate: int,
+    config: app_control.AppsConfig,
+) -> None:
+    """Run the wake-word triggered voice loop."""
+    loop = asyncio.get_running_loop()
+    trigger_queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
+
+    detector = wake_word_mod.start(
+        trigger_queue,
+        loop,
+        model_name=wake_word,
+        threshold=threshold,
+    )
+    print(f"Say '{wake_word.replace('_', ' ')}' to activate Kira. Press Ctrl+C to stop.")
+    try:
+        while True:
+            await trigger_queue.get()
+            while not trigger_queue.empty():
+                trigger_queue.get_nowait()
+            overlay.show()
+            try:
+                await run_capture_once(
+                    record_seconds=record_seconds,
+                    sample_rate=sample_rate,
+                    confirm=_confirm_in_terminal,
+                    config=config,
+                )
+            finally:
+                overlay.hide()
+    finally:
+        detector.stop()
 
 
 def _queue_hotkey_trigger(queue: asyncio.Queue[None]) -> None:
