@@ -136,9 +136,23 @@ def find_mode(phrase: str, config: AppsConfig | None = None) -> ModeDefinition |
 
 
 def open_app(app_name: str, config: AppsConfig | None = None) -> ActionResult:
-    """Open a configured app, falling back to a sanitized app name."""
+    """Open a configured app, falling back to a sanitized app name.
+
+    If the app is already running, focuses its window instead of launching
+    a second instance.
+    """
     apps_config = config or load_apps_config()
     app = find_app(app_name, apps_config)
+
+    close_terms = app.close_names if app and app.close_names else [app_name]
+    running = _matching_processes(close_terms)
+    if running:
+        focused = _focus_process(running[0])
+        label = app.name if app else app_name
+        if focused:
+            return ActionResult(ok=True, message=f"{label} is already running — focused.", spoken=f"{label} is already open.")
+        return ActionResult(ok=True, message=f"{label} is already running.", spoken=f"{label} is already open.")
+
     if app is not None:
         return _launch_command(app.open_command, app.name)
 
@@ -343,6 +357,33 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
+
+
+def _focus_process(proc: psutil.Process) -> bool:
+    """Bring the main window of a process to the foreground. Returns True on success."""
+    try:
+        import win32gui
+        import win32con
+
+        pid = proc.pid
+
+        def _callback(hwnd: int, found: list[int]) -> bool:
+            if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowThreadProcessId(hwnd)[1] == pid:
+                found.append(hwnd)
+            return True
+
+        hwnds: list[int] = []
+        win32gui.EnumWindows(_callback, hwnds)
+        if not hwnds:
+            return False
+        hwnd = hwnds[0]
+        if win32gui.IsIconic(hwnd):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+        return True
+    except Exception as exc:
+        logger.debug("Could not focus window for PID %d: %s", proc.pid, exc)
+        return False
 
 
 def _normalize_key(value: str) -> str:

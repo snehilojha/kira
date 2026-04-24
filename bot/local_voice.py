@@ -11,6 +11,7 @@ local commands, and speaks a short result through the PC speakers.
 from __future__ import annotations
 
 import asyncio
+import collections
 import io
 import json
 import logging
@@ -25,7 +26,13 @@ import psutil
 from dotenv import load_dotenv
 
 from bot import app_control
+from bot import brain
+from bot import db
+from bot import desktop_control
+from bot import identity
+from bot import overlay
 from bot import provider
+from bot import screen_vision
 from bot import voice
 
 logger = logging.getLogger(__name__)
@@ -35,9 +42,15 @@ _ENV_PATH = _PROJECT_ROOT / ".env"
 _DEFAULT_LOG_PATH = _PROJECT_ROOT / "logs" / "local_voice.log"
 _DEFAULT_SAMPLE_RATE = 16000
 _DEFAULT_RECORD_SECONDS = 5.0
+_DEFAULT_MAX_RECORD_SECONDS = 15.0
+_DEFAULT_SILENCE_SECONDS = 0.8
+_DEFAULT_SILENCE_RMS = 200
 _DEFAULT_TRIGGER = "hotkey"
 _DEFAULT_HOTKEY = "ctrl+alt+k"
 ConfirmCallback = Callable[[str], Awaitable[bool]]
+
+# Rolling history of the last 5 voice commands (transcript, result message)
+_command_history: collections.deque[tuple[str, str]] = collections.deque(maxlen=5)
 
 
 @dataclass(frozen=True)
@@ -76,13 +89,17 @@ def parse_deterministic(
     for prefix in ("open ", "launch ", "start "):
         if text.startswith(prefix):
             app_name = text[len(prefix):].strip()
-            if app_name:
-                return ParsedCommand(command="/open", args=[app_name], source="deterministic")
+            # Only match simple single-word or configured app names.
+            # Multi-word phrases with conjunctions ("and", "then") are complex
+            # commands and should fall through to the LLM parser.
+            if app_name and not any(w in app_name.split() for w in ("and", "then", "after", "search", "go", "navigate")):
+                if app_name in (apps_config.apps or {}) or len(app_name.split()) <= 3:
+                    return ParsedCommand(command="/open", args=[app_name], source="deterministic")
 
     for prefix in ("close ", "quit ", "exit "):
         if text.startswith(prefix):
             app_name = text[len(prefix):].strip()
-            if app_name:
+            if app_name and not any(w in app_name.split() for w in ("and", "then", "after")):
                 return ParsedCommand(command="/close_apps", args=[app_name], source="deterministic")
 
     if text in {"status", "system status", "what is running"}:
@@ -103,11 +120,19 @@ async def parse_with_llm(transcript: str) -> ParsedCommand | None:
         "You translate local PC voice requests into one Kira command. "
         "Return ONLY JSON: {\"command\": string, \"args\": [strings]}.\n\n"
         "Supported safe commands:\n"
-        "- /open <app>\n"
+        "- /open <app>  (works for any app, not just configured ones)\n"
         "- /close_apps <app>\n"
         "- /status\n"
         "- /sysinfo\n"
-        "- /mode_run <mode>\n\n"
+        "- /mode_run <mode>\n"
+        "- /click <button> <count>  (button: left/right/middle, count: integer)\n"
+        "- /mouse_move <x> <y>\n"
+        "- /scroll <amount>  (positive=up, negative=down)\n"
+        "- /type <text to type>\n"
+        "- /press <key>  (e.g. space, enter, playpause, volumeup, volumedown)\n"
+        "- /hotkey <key1> <key2> ...  (e.g. ctrl alt delete)\n"
+        "- /copy <text>\n"
+        "- /paste\n\n"
         "Supported risky commands, which will require terminal confirmation:\n"
         "- /shell <command>\n"
         "- /sleep\n"
@@ -116,6 +141,13 @@ async def parse_with_llm(transcript: str) -> ParsedCommand | None:
         "- /kill <pid>\n\n"
         f"Configured apps: {app_names}\n"
         f"Configured modes: {mode_names}\n"
+        "Examples:\n"
+        "  'click' -> {\"command\": \"/click\", \"args\": [\"left\", \"1\"]}\n"
+        "  'press space' -> {\"command\": \"/press\", \"args\": [\"space\"]}\n"
+        "  'play pause' -> {\"command\": \"/press\", \"args\": [\"playpause\"]}\n"
+        "  'volume up' -> {\"command\": \"/press\", \"args\": [\"volumeup\"]}\n"
+        "  'type hello world' -> {\"command\": \"/type\", \"args\": [\"hello world\"]}\n"
+        "  'open notepad' -> {\"command\": \"/open\", \"args\": [\"notepad\"]}\n"
         "If the request is not about local PC control, return "
         "{\"command\":\"\",\"args\":[]}."
     )
@@ -206,11 +238,139 @@ async def execute_command(
         message = _format_sysinfo()
         return LocalVoiceResult(ok=True, message=message, spoken="System info is ready.")
 
+    desktop_result = desktop_control.execute_command(parsed.command, parsed.args)
+    if desktop_result is not None:
+        return _from_action_result(desktop_result)
+
     return LocalVoiceResult(
         ok=False,
         message=f"Command {parsed.command} is not supported by local voice yet.",
         spoken="That command is not supported locally yet.",
     )
+
+
+_IDENTITY_QUERIES = {
+    "who am i",
+    "what do you know about me",
+    "what do you know about me?",
+    "tell me what you know about me",
+    "what have you remembered",
+    "what have you remembered about me",
+    "what do you remember about me",
+    "do you know who i am",
+    "who are you",
+    "what are you",
+    "introduce yourself",
+}
+
+
+def _is_identity_query(text: str) -> bool:
+    return _normalize_text(text) in _IDENTITY_QUERIES
+
+
+_SCREEN_PHRASES = {
+    "what's on my screen",
+    "what is on my screen",
+    "what do you see",
+    "what am i working on",
+    "what's on screen",
+    "what is on screen",
+    "look at my screen",
+    "what's open",
+    "what is open",
+    "what's on the screen",
+    "describe my screen",
+    "describe the screen",
+}
+
+
+def _is_screen_query(text: str) -> bool:
+    normalized = _normalize_text(text)
+    return normalized in _SCREEN_PHRASES
+
+
+_MULTISTEP_SIGNALS = (
+    " and search ", " and go to ", " and navigate ", " and open ", " and play ",
+    " then search ", " then go ", " then open ",
+)
+
+_MULTISTEP_EXACT = {
+    "play the first video",
+    "play first video",
+    "click the first video",
+    "click first result",
+    "play the first result",
+    "open the first result",
+    "open the first video",
+}
+
+
+def _is_multistep(text: str) -> bool:
+    """Return True for phrases that describe a sequence of actions."""
+    normalized = _normalize_text(text)
+    if normalized in _MULTISTEP_EXACT:
+        return True
+    return any(signal in normalized for signal in _MULTISTEP_SIGNALS)
+
+
+def _pick_filler(transcript: str) -> str:
+    """Return a short spoken filler for queries that need processing time, or empty string for instant commands."""
+    normalized = _normalize_text(transcript)
+
+    # Instant commands — no filler, they respond in under a second
+    instant_prefixes = ("open ", "close ", "press ", "click", "scroll", "type ", "volume", "play pause", "mute")
+    if any(normalized.startswith(p) for p in instant_prefixes):
+        return ""
+    if normalized in {"status", "system status", "sysinfo", "system info"}:
+        return ""
+
+    # Screen queries
+    if _is_screen_query(transcript):
+        return "Let me take a look."
+
+    # Multi-step actions
+    if _is_multistep(transcript):
+        return "On it."
+
+    # General knowledge / brain queries
+    question_words = ("what", "who", "when", "where", "why", "how", "is ", "are ", "can ", "will ", "tell me", "search")
+    if any(normalized.startswith(w) for w in question_words):
+        return "Let me check."
+
+    return ""
+
+
+def _history_context() -> str:
+    """Return the last few commands as a plain-text context string."""
+    if not _command_history:
+        return ""
+    lines = [f"{i + 1}. User: {t!r} → {r}" for i, (t, r) in enumerate(_command_history)]
+    return "Recent commands:\n" + "\n".join(lines)
+
+
+def _build_identity_reply(transcript: str) -> str:
+    """Return a spoken summary of Kira's identity or what she knows about the user."""
+    normalized = _normalize_text(transcript)
+    user_name = identity.get_user_name()
+    facts = identity.get_all_facts()
+
+    if normalized in {"who are you", "what are you", "introduce yourself"}:
+        name_part = f", {user_name}" if user_name else ""
+        return (
+            f"I'm Kira{name_part} — your personal AI. "
+            "Think of me as your FRIDAY. I run on your PC, I know your setup, "
+            "and I'm here whenever you need me."
+        )
+
+    # "who am I", "what do you know about me", etc.
+    if not facts:
+        return (
+            f"Honestly, I don't know much about you yet{', ' + user_name if user_name else ''}. "
+            "Tell me things and I'll remember them."
+        )
+    facts_spoken = ". ".join(f[:100] for f in facts[:6])
+    name_part = user_name or "you"
+    return f"Here's what I know about {name_part}: {facts_spoken}."
 
 
 async def handle_transcript(
@@ -220,20 +380,253 @@ async def handle_transcript(
     config: app_control.AppsConfig | None = None,
 ) -> tuple[ParsedCommand | None, LocalVoiceResult]:
     """Parse and execute one transcript."""
+    # Memory / identity commands are intercepted before anything else.
+    memory_reply = identity.extract_memory_from_transcript(transcript)
+    if memory_reply:
+        _command_history.append((transcript, memory_reply[:80]))
+        return None, LocalVoiceResult(ok=True, message=memory_reply, spoken=memory_reply)
+
+    if _is_identity_query(transcript):
+        spoken = _build_identity_reply(transcript)
+        _command_history.append((transcript, spoken[:80]))
+        return None, LocalVoiceResult(ok=True, message=spoken, spoken=spoken)
+
+    if _is_screen_query(transcript):
+        description = await screen_vision.capture_screen()
+        _command_history.append((transcript, description[:80]))
+        return None, LocalVoiceResult(ok=True, message=description, spoken=description)
+
+    if _is_multistep(transcript):
+        result = await _handle_multistep(transcript)
+        _command_history.append((transcript, result.message[:80]))
+        return None, result
+
     apps_config = config or app_control.load_apps_config()
     parsed = parse_deterministic(transcript, apps_config)
     if parsed is None:
         parsed = await parse_with_llm(transcript)
 
     if parsed is None:
-        return None, LocalVoiceResult(
-            ok=False,
-            message="I could not map that to a local command.",
-            spoken="I could not map that to a local command.",
-        )
+        result = await _handle_with_brain(transcript)
+        _command_history.append((transcript, result.message[:80]))
+        return None, result
 
     result = await execute_command(parsed, confirm=confirm, config=apps_config)
+    _command_history.append((transcript, result.message[:80]))
     return parsed, result
+
+
+async def _handle_multistep(transcript: str) -> LocalVoiceResult:
+    """Decompose a multi-step voice command into single commands and execute them."""
+    config = app_control.load_apps_config()
+    app_names = ", ".join(sorted(config.apps)) or "(none configured)"
+    history = _history_context()
+
+    system_prompt = (
+        "You decompose a multi-step PC voice command into an ordered list of single Kira commands. "
+        "Return ONLY a JSON array of command objects: [{\"command\": string, \"args\": [strings]}, ...]\n\n"
+        "Available commands:\n"
+        "- /open <app>\n"
+        "- /close_apps <app>\n"
+        "- /type <text>\n"
+        "- /press <key>  (e.g. enter, space, playpause)\n"
+        "- /hotkey <key1> <key2>\n"
+        "- /click <button> <count>\n"
+        "- /scroll <amount>\n"
+        "- /wait  (inserts a short pause between steps)\n\n"
+        f"Configured apps: {app_names}\n\n"
+        "IMPORTANT rules:\n"
+        "- Always insert a /wait after /open to let the app focus before typing.\n"
+        "- For any search in a browser, always open a new tab first with /hotkey ctrl t, then type the URL.\n"
+        "- This ensures searches never interfere with the current page.\n\n"
+        "Example 1: 'open chrome and search youtube for lo-fi music' ->\n"
+        "[{\"command\": \"/open\", \"args\": [\"chrome\"]},\n"
+        " {\"command\": \"/wait\", \"args\": []},\n"
+        " {\"command\": \"/hotkey\", \"args\": [\"ctrl\", \"t\"]},\n"
+        " {\"command\": \"/wait\", \"args\": []},\n"
+        " {\"command\": \"/type\", \"args\": [\"youtube.com/results?search_query=lo-fi+music\"]},\n"
+        " {\"command\": \"/press\", \"args\": [\"enter\"]}]\n\n"
+        "Example 2: 'play the first video' (on a YouTube search results page) ->\n"
+        "[{\"command\": \"/press\", \"args\": [\"tab\"]},\n"
+        " {\"command\": \"/wait\", \"args\": []},\n"
+        " {\"command\": \"/press\", \"args\": [\"enter\"]}]\n\n"
+        + (f"{history}\n\n" if history else "")
+    )
+
+    response = await provider.create_chat_completion(
+        role="fast",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": transcript},
+        ],
+        temperature=0,
+        max_tokens=400,
+    )
+    raw = (response.choices[0].message.content or "").strip()
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw).strip()
+
+    try:
+        steps = json.loads(raw)
+        if not isinstance(steps, list):
+            raise ValueError("not a list")
+    except (json.JSONDecodeError, ValueError):
+        return await _handle_with_brain(transcript)
+
+    # If steps mention browser actions but no /open, prepend a focus of chrome
+    commands_in_steps = [str(s.get("command", "")).strip().lower() for s in steps]
+    has_open = any(c == "/open" for c in commands_in_steps)
+    has_browser_action = any(
+        c in ("/hotkey", "/type") for c in commands_in_steps
+    )
+    if not has_open and has_browser_action:
+        steps = [{"command": "/open", "args": ["chrome"]}] + steps
+
+    messages = []
+    for step in steps:
+        command = str(step.get("command", "")).strip().lower()
+        args = [str(a) for a in step.get("args", [])]
+
+        if command == "/wait":
+            await asyncio.sleep(2.5)
+            continue
+
+        parsed = ParsedCommand(command=command, args=args, source="multistep", risky=is_risky_command(command, args))
+        result = await execute_command(parsed, config=config)
+        messages.append(result.message)
+
+        if command == "/open":
+            await asyncio.sleep(2.5)
+        else:
+            await asyncio.sleep(0.4)
+
+    spoken = "Done." if messages else "I could not complete that."
+    return LocalVoiceResult(ok=True, message="\n".join(messages), spoken=spoken)
+
+
+async def _handle_with_brain(transcript: str) -> LocalVoiceResult:
+    """Answer general queries using the LLM with web search tool."""
+    import openai as _openai
+
+    config = provider.load_config()
+    client = _openai.AsyncOpenAI(
+        api_key=config.api_key,
+        **({"base_url": config.base_url} if config.base_url else {}),
+    )
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the web for current information — news, weather, sports, facts.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        }
+    ]
+
+    history = _history_context()
+    identity_block = identity.get_identity_prompt()
+    user_name = identity.get_user_name()
+    system = (
+        f"{identity_block}\n\n"
+        "Rules for how you talk:\n"
+        f"- Address the user as '{user_name}' occasionally but not every response — keep it natural.\n"
+        "- Speak naturally, like a real person. Use contractions. Don't be formal.\n"
+        "- Never start a sentence with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
+        "- Match response length to the question. Simple = one or two sentences. Complex = short paragraph max.\n"
+        "- No markdown. No bullet points. No headers. Your response is read aloud via TTS.\n"
+        "- Be direct and confident. Don't hedge with 'I think' or 'it seems like' unless genuinely uncertain.\n"
+        "- If you don't know something or it requires current data, use web_search — don't say you can't look it up.\n"
+        "- Never mention that you're an AI or that you have limitations unless directly asked.\n"
+        "- If screen context is provided, use it to give more relevant answers.\n"
+        "Always use web_search for current events, news, weather, prices, sports scores, or anything time-sensitive."
+        + (f"\n\n{history}" if history else "")
+    )
+
+    # Silently grab screen context for queries that might benefit from it
+    screen_context = ""
+    screen_trigger_words = ("this", "here", "open", "screen", "working", "see", "look", "current", "active")
+    if any(w in _normalize_text(transcript) for w in screen_trigger_words):
+        try:
+            screen_context = await screen_vision.capture_screen(
+                "Briefly describe what application is open and what the user appears to be doing. One sentence."
+            )
+        except Exception:
+            pass
+
+    user_content = transcript
+    if screen_context:
+        user_content = f"{transcript}\n\n[Screen context: {screen_context}]"
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+    try:
+        for _ in range(3):
+            response = await client.chat.completions.create(
+                model=config.smart_model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=400,
+            )
+            msg = response.choices[0].message
+
+            if msg.tool_calls:
+                messages.append(msg)
+                for tc in msg.tool_calls:
+                    if tc.function.name == "web_search":
+                        query = json.loads(tc.function.arguments).get("query", transcript)
+                        search_result = await asyncio.to_thread(_web_search, query)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": search_result,
+                        })
+            else:
+                spoken = (msg.content or "I'm not sure how to answer that.").strip()
+                return LocalVoiceResult(ok=True, message=spoken, spoken=spoken)
+
+        spoken = "I wasn't able to find an answer."
+        return LocalVoiceResult(ok=False, message=spoken, spoken=spoken)
+
+    except Exception as exc:
+        message = f"Brain fallback failed: {exc}"
+        logger.warning(message)
+        return LocalVoiceResult(ok=False, message=message, spoken="I ran into an error trying to answer that.")
+
+
+def _web_search(query: str) -> str:
+    """Run a DuckDuckGo search and return top results as plain text."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        from duckduckgo_search import DDGS
+
+    try:
+        with DDGS() as ddgs:
+            hits = list(ddgs.text(query, max_results=5))
+    except Exception as exc:
+        return f"Search failed: {exc}"
+
+    if not hits:
+        return "No results found."
+
+    lines = []
+    for i, hit in enumerate(hits, 1):
+        title = (hit.get("title") or "").strip()
+        body = (hit.get("body") or "").strip()
+        lines.append(f"{i}. {title}: {body}")
+    return "\n\n".join(lines)
 
 
 async def run_capture_once(
@@ -277,6 +670,9 @@ async def run_capture_once(
         await speak(result.spoken)
         return result
     print(f"Heard: {transcript}")
+    filler = _pick_filler(transcript)
+    if filler:
+        await speak(filler)
 
     try:
         parsed, result = await handle_transcript(
@@ -306,15 +702,42 @@ def record_wav_bytes(
     *,
     seconds: float = _DEFAULT_RECORD_SECONDS,
     sample_rate: int = _DEFAULT_SAMPLE_RATE,
+    max_seconds: float = _DEFAULT_MAX_RECORD_SECONDS,
+    silence_seconds: float = _DEFAULT_SILENCE_SECONDS,
+    silence_rms: int = _DEFAULT_SILENCE_RMS,
 ) -> bytes:
-    """Record from the default microphone and return WAV bytes."""
+    """Record from the default microphone and return WAV bytes.
+
+    Stops early when the mic has been silent for ``silence_seconds``.
+    Never records longer than ``max_seconds`` regardless of input.
+    The legacy ``seconds`` parameter is kept for callers that pass it
+    explicitly, but is no longer used as the fixed clip length.
+    """
     import numpy as np
     import sounddevice as sd
 
-    frames = int(seconds * sample_rate)
-    audio = sd.rec(frames, samplerate=sample_rate, channels=1, dtype="int16")
-    sd.wait()
+    chunk = int(sample_rate * 0.1)   # 100 ms per chunk
+    max_chunks = int(max_seconds / 0.1)
+    silent_chunks_needed = int(silence_seconds / 0.1)
 
+    recorded: list[np.ndarray] = []
+    silent_count = 0
+    speech_started = False
+
+    with sd.InputStream(samplerate=sample_rate, channels=1, dtype="int16") as stream:
+        for _ in range(max_chunks):
+            data, _ = stream.read(chunk)
+            recorded.append(data.copy())
+            rms = int(np.sqrt(np.mean(data.astype(np.float32) ** 2)))
+            if rms >= silence_rms:
+                speech_started = True
+                silent_count = 0
+            elif speech_started:
+                silent_count += 1
+                if silent_count >= silent_chunks_needed:
+                    break
+
+    audio = np.concatenate(recorded, axis=0)
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav_file:
         wav_file.setnchannels(1)
@@ -362,6 +785,7 @@ async def _confirm_in_terminal(command_preview: str) -> bool:
     return answer.strip().lower() in {"y", "yes"}
 
 
+
 async def run_loop() -> None:
     """Run the local push-to-talk loop until interrupted."""
     load_dotenv(_ENV_PATH, override=True)
@@ -373,6 +797,8 @@ async def run_loop() -> None:
     hotkey = os.environ.get("KIRA_LOCAL_VOICE_HOTKEY", _DEFAULT_HOTKEY).strip() or _DEFAULT_HOTKEY
     config = app_control.load_apps_config()
 
+    await db.init_db()
+    overlay.start()
     print("Kira local voice is ready.")
     logger.info("Kira local voice is ready")
     if trigger == "enter":
@@ -434,18 +860,22 @@ async def _run_hotkey_loop(
         await _run_enter_loop(record_seconds=record_seconds, sample_rate=sample_rate, config=config)
         return
 
-    print(f"Press {hotkey} to record {record_seconds:g}s. Press Ctrl+C to stop.")
+    print(f"Press {hotkey} to record. Press Ctrl+C to stop.")
     try:
         while True:
             await trigger_queue.get()
             while not trigger_queue.empty():
                 trigger_queue.get_nowait()
-            await run_capture_once(
-                record_seconds=record_seconds,
-                sample_rate=sample_rate,
-                confirm=_confirm_in_terminal,
-                config=config,
-            )
+            overlay.show()
+            try:
+                await run_capture_once(
+                    record_seconds=record_seconds,
+                    sample_rate=sample_rate,
+                    confirm=_confirm_in_terminal,
+                    config=config,
+                )
+            finally:
+                overlay.hide()
     finally:
         try:
             keyboard.remove_hotkey(hotkey)

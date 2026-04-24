@@ -19,6 +19,7 @@ _DEFAULT_POLICY = {
         "file_read",
         "grep",
         "glob",
+        "web_search",
         "process_status",
         "schedule_status",
         "watch_status",

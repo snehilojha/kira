@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from astra_node.core.events import AgentError, TextDelta, ToolResult, ToolStart, TurnEnd
+from astra_node.core.tool import BaseTool, PermissionLevel, ToolContext
+from pydantic import BaseModel, Field
 
 from bot import approval
 from bot import capability_policy
@@ -30,7 +32,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _PROJECT_CONTEXT_PATH = Path(
     os.environ.get("PROJECT_CONTEXT_PATH", str(_PROJECT_ROOT / "context.md"))
 )
-_READ_ONLY_COMPLEX_TOOLS = ["file_read", "grep", "glob"]
+_READ_ONLY_COMPLEX_TOOLS = ["file_read", "grep", "glob", "web_search"]
 _CONFIRMATION_TOOLS = ["bash", "registered_script_run", "test_command_run"]
 ApprovalCallback = Callable[[approval.ApprovalRequest], Awaitable[bool]]
 
@@ -442,6 +444,49 @@ def _build_event_source(
     )
 
 
+class _WebSearchInput(BaseModel):
+    query: str = Field(..., description="Search query string.")
+
+
+class _WebSearchTool(BaseTool):
+    """Search the web via DuckDuckGo and return top results as plain text."""
+
+    name = "web_search"
+    description = (
+        "Search the web for current information. Use for news, facts, weather, "
+        "prices, or anything that requires up-to-date knowledge."
+    )
+    input_schema = _WebSearchInput
+    permission_level = PermissionLevel.ALWAYS_ALLOW
+
+    def execute(self, input: _WebSearchInput, ctx: ToolContext) -> ToolResult:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            try:
+                from duckduckgo_search import DDGS
+            except ImportError:
+                return ToolResult.err("ddgs is not installed. Run: pip install ddgs")
+
+        try:
+            with DDGS() as ddgs:
+                hits = list(ddgs.text(input.query, max_results=5))
+        except Exception as exc:
+            return ToolResult.err(f"Web search failed: {exc}")
+
+        if not hits:
+            return ToolResult.ok("No results found.")
+
+        lines = []
+        for i, hit in enumerate(hits, 1):
+            title = (hit.get("title") or "").encode("utf-8", "replace").decode("utf-8").strip()
+            body = (hit.get("body") or "").encode("utf-8", "replace").decode("utf-8").strip()
+            href = (hit.get("href") or "").strip()
+            lines.append(f"{i}. {title}\n   {body}\n   {href}")
+
+        return ToolResult.ok("\n\n".join(lines))
+
+
 def _build_runtime_components(
     execution_context: ExecutionContext,
     *,
@@ -477,6 +522,7 @@ def _build_runtime_components(
         BashTool(),
         RegisteredScriptRunTool(),
         TestCommandRunTool(),
+        _WebSearchTool(),
     ):
         if tool.name in execution_context.available_tools:
             registry.register(tool)
@@ -751,25 +797,52 @@ def _detect_provider_name(llm_provider: Any) -> str:
 
 
 def _build_system_prompt(execution_context: ExecutionContext) -> str:
-    """Build the system prompt for Kira's read-only complex task runtime."""
-    sections = [
-        (
-            "You are Kira, a personal AI collaborator running on a Windows machine. "
-            "For this task you are in read-only complex analysis mode."
-        ),
-        (
-            "You may inspect the codebase and machine context using the available "
-            "read-only tools. Do not claim to have changed files, run mutating "
-            "commands, or taken actions you cannot perform."
-        ),
-        (
-            "Any action that would normally require confirmation must go through "
-            "Kira's explicit approval flow before it can run."
-        ),
-        "Available tools: " + ", ".join(execution_context.available_tools),
-        "Capability policy: " + str(execution_context.capability_policy),
-        "State snapshot:\n" + _format_state_snapshot(execution_context.state_snapshot),
-    ]
+    """Build the system prompt for Kira's complex task runtime."""
+    source = execution_context.state_snapshot.get("task_source", "")
+
+    if source == "local_voice":
+        from bot import identity as kira_identity
+        identity_block = kira_identity.get_identity_prompt()
+        user_name = kira_identity.get_user_name()
+        sections = [
+            (
+                f"{identity_block}\n\n"
+                "Rules:\n"
+                f"- Address the user as '{user_name}' occasionally but not every response.\n"
+                "- Speak naturally, like a real person. Use contractions.\n"
+                "- Never start with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
+                "- Match response length to the question. One sentence for simple facts. Two to three sentences max for complex ones.\n"
+                "- No markdown, no bullet points, no headers. Your response is read aloud via TTS.\n"
+                "- Be confident and direct. Skip filler phrases like 'Great question' or 'I think'.\n"
+                "- Never mention being an AI or having limitations unless directly asked.\n"
+                "- If screen context is provided, use it to give more relevant answers."
+            ),
+            (
+                "Always use web_search for current events, news, weather, prices, sports scores, "
+                "or anything time-sensitive. Search before admitting you don't know."
+            ),
+            "Available tools: " + ", ".join(execution_context.available_tools),
+            "State snapshot:\n" + _format_state_snapshot(execution_context.state_snapshot),
+        ]
+    else:
+        sections = [
+            (
+                "You are Kira, a personal AI collaborator running on a Windows machine. "
+                "For this task you are in read-only complex analysis mode."
+            ),
+            (
+                "You may inspect the codebase and machine context using the available "
+                "read-only tools. Do not claim to have changed files, run mutating "
+                "commands, or taken actions you cannot perform."
+            ),
+            (
+                "Any action that would normally require confirmation must go through "
+                "Kira's explicit approval flow before it can run."
+            ),
+            "Available tools: " + ", ".join(execution_context.available_tools),
+            "Capability policy: " + str(execution_context.capability_policy),
+            "State snapshot:\n" + _format_state_snapshot(execution_context.state_snapshot),
+        ]
 
     if execution_context.memory_context:
         sections.append("\n\n".join(execution_context.memory_context))

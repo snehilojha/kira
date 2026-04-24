@@ -162,6 +162,39 @@ async def notify_if_actionable(
         logger.debug("Screen vision [%s] — not actionable, no notification sent", trigger)
 
 
+async def capture_screen(question: str = "") -> str:
+    """Take a screenshot and answer a free-form question about what's on screen.
+
+    Unlike ``capture_and_analyse``, this has no trigger type or cooldown —
+    it's meant for on-demand voice queries like 'what's on my screen'.
+    """
+    image_b64 = await asyncio.to_thread(_take_screenshot)
+    if not image_b64:
+        return "I couldn't take a screenshot."
+
+    prompt = (
+        question.strip()
+        or (
+            "Describe what is currently visible on the screen in 2-3 sentences. "
+            "Focus on the active application and what the user appears to be doing."
+        )
+    )
+
+    try:
+        from bot import provider
+        response = await provider.create_vision_completion(
+            prompt=prompt,
+            image_b64=image_b64,
+            max_tokens=300,
+        )
+        return (response.choices[0].message.content or "").strip()
+    except RuntimeError:
+        return "Vision model is not available."
+    except Exception as exc:
+        logger.warning("Screen capture query failed: %s", exc)
+        return f"Screen analysis failed: {exc}"
+
+
 # ── Internal helpers ──────────────────────────────────────────────
 
 def _take_screenshot() -> str:
