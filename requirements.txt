@@ -15,3 +15,4 @@ sounddevice
 numpy
 keyboard
 yfinance
+opencv-python

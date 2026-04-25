@@ -604,6 +604,24 @@ class _KiraOverlay(QWidget):
     def _set_weather_text(self, text: str) -> None:
         self._right.set_weather(text)
 
+    @pyqtSlot()
+    def _launch_webcam_preview(self) -> None:
+        try:
+            from bot.webcam_preview import WebcamPreview
+            self._webcam_preview = WebcamPreview.create()
+        except Exception as exc:
+            logger.debug("Could not launch webcam preview: %s", exc)
+
+    @pyqtSlot()
+    def _destroy_webcam_preview(self) -> None:
+        preview = getattr(self, "_webcam_preview", None)
+        if preview is not None:
+            try:
+                preview.close()
+            except Exception:
+                pass
+            self._webcam_preview = None
+
     # ── Fade ──────────────────────────────────────────────────────
 
     def _fade_to(self, target: float, on_done=None) -> None:

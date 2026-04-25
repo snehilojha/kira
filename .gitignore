@@ -20,7 +20,7 @@ env/
 # Logs
 logs/
 
-# Data (DB, portfolio, etc.)
+# # Data (DB, portfolio, etc.)
 data/
 
 # IDE / tooling
