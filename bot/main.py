@@ -25,6 +25,7 @@ from bot import mode
 from bot import monitor
 from bot import observer
 from bot import notifier
+from bot import overlay
 from bot import scheduler
 from bot import task_state
 from bot import watchdog
@@ -253,7 +254,10 @@ def main() -> None:
         )
     )
 
-    # 8. Start polling
+    # 9. Start overlay from main thread before handing control to PTB
+    overlay.start()
+
+    # 10. Start polling
     logger.info("Bot is live — polling for updates")
     app.run_polling(drop_pending_updates=True)
 

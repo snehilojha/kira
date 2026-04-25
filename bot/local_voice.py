@@ -1453,7 +1453,6 @@ async def start_as_task() -> None:
 
     confirm = _smart_confirm
 
-    overlay.start()
     logger.info("Kira voice loop starting (trigger=%s)", trigger)
 
     try:

@@ -139,6 +139,9 @@ async def start() -> None:
     Polls every KIRA_MODE_POLL_SECONDS. Transitions between active_session
     and autonomous based on last keyboard/mouse input time.
     """
+    import time
+    global _last_voice_activity
+
     idle_threshold = _idle_threshold()
     poll_interval = _poll_interval()
     logger.info(
@@ -146,8 +149,11 @@ async def start() -> None:
         idle_threshold, poll_interval,
     )
 
-    # On startup, transition out of 'idle' based on current presence signal.
-    await _tick(idle_threshold)
+    # Treat startup as user-present — GetLastInputInfo is unreliable when
+    # launched via Task Scheduler (non-interactive session). Give a full
+    # idle_threshold grace period before the first autonomous check.
+    _last_voice_activity = time.monotonic()
+    await set_mode("active_session", "startup grace period")
 
     while True:
         try:
