@@ -1115,9 +1115,11 @@ async def run_capture_once(
     global _last_user_hwnd
     apps_config = config or app_control.load_apps_config()
     from bot import mode as _mode
+    from bot import ui_mode as _ui_mode
     _mode.mark_user_active()
     _last_user_hwnd = _capture_foreground_hwnd()
     print("Recording...")
+    overlay.set_state("listening")
     try:
         wav_bytes = await asyncio.to_thread(
             record_wav_bytes,
@@ -1132,10 +1134,12 @@ async def run_capture_once(
             message=message,
             spoken="Recording failed. Please check the microphone.",
         )
+        overlay.set_state("idle")
         await speak(result.spoken)
         return result
 
     print("Transcribing...")
+    overlay.set_state("thinking")
     try:
         transcript = await voice.transcribe(wav_bytes, suffix=".wav")
     except Exception as exc:
@@ -1146,13 +1150,25 @@ async def run_capture_once(
             message=message,
             spoken="Transcription failed. Please check the API key.",
         )
+        overlay.set_state("idle")
         await speak(result.spoken)
         return result
     print(f"Heard: {transcript}")
+
+    # ── Full mode voice triggers ───────────────────────────────
+    _lower = transcript.strip().lower()
+    if any(p in _lower for p in ("take over", "activate full", "full mode")):
+        _ui_mode.activate("voice command")
+    elif any(p in _lower for p in ("stand down", "deactivate", "exit full", "compact mode")):
+        _ui_mode.deactivate("voice command")
+
+    overlay.set_transcript(transcript, "")
+
     filler = _pick_filler(transcript)
     if filler:
         await speak(filler)
 
+    overlay.set_state("thinking")
     try:
         parsed, result = await handle_transcript(
             transcript,
@@ -1167,13 +1183,17 @@ async def run_capture_once(
             message=message,
             spoken="I ran into an error while handling that command.",
         )
+        overlay.set_state("idle")
         await speak(result.spoken)
         return result
 
     if parsed is not None:
         print(f"Command: {_format_command(parsed)} [{parsed.source}]")
     print(result.message)
+    overlay.set_state("speaking")
+    overlay.set_transcript(transcript, result.spoken or "")
     await speak(result.spoken)
+    overlay.set_state("idle")
     return result
 
 
