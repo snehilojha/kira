@@ -70,17 +70,45 @@ async def synthesise(text: str, response_format: str | None = None) -> tuple[byt
     """Convert text to speech and return (audio_bytes, format).
 
     Format is chosen automatically based on the active TTS model.
-    Callers should use play_audio() which handles both wav and mp3.
+    Falls back to OpenAI gpt-4o-mini-tts if the primary provider fails.
     """
     fmt = response_format or _tts_format()
-    response = await provider.synthesise_speech(
-        text=_prepare_text(text),
-        voice=_get_voice_name(),
-        response_format=fmt,
-    )
-    audio_bytes = response.read()
-    logger.info("TTS synthesised %d bytes for %d chars (fmt=%s)", len(audio_bytes), len(text), fmt)
-    return audio_bytes, fmt
+    try:
+        response = await provider.synthesise_speech(
+            text=_prepare_text(text),
+            voice=_get_voice_name(),
+            response_format=fmt,
+        )
+        audio_bytes = response.read()
+        logger.info("TTS synthesised %d bytes for %d chars (fmt=%s)", len(audio_bytes), len(text), fmt)
+        return audio_bytes, fmt
+    except Exception as primary_exc:
+        logger.warning("Primary TTS failed (%s) — falling back to fallback TTS", primary_exc)
+        try:
+            from openai import AsyncOpenAI
+            fallback_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+            fallback_model = os.environ.get("KIRA_TTS_FALLBACK_MODEL", "gpt-4o-mini-tts")
+            fallback_voice = os.environ.get("KIRA_TTS_FALLBACK_VOICE", "nova")
+            fallback_instructions = os.environ.get(
+                "KIRA_TTS_FALLBACK_INSTRUCTIONS",
+                "Speak as Kira, a calm, intelligent, and warm personal AI assistant. "
+                "Natural pace, slightly warm tone. Never robotic or overly chipper.",
+            )
+            fallback_kwargs: dict = dict(
+                model=fallback_model,
+                voice=fallback_voice,
+                input=_prepare_text(text),
+                response_format="mp3",
+            )
+            if "mini-tts" in fallback_model or "4o" in fallback_model:
+                fallback_kwargs["instructions"] = fallback_instructions
+            fallback_response = await fallback_client.audio.speech.create(**fallback_kwargs)
+            audio_bytes = fallback_response.read()
+            logger.info("Fallback TTS synthesised %d bytes", len(audio_bytes))
+            return audio_bytes, "mp3"
+        except Exception as fallback_exc:
+            logger.error("Fallback TTS also failed: %s", fallback_exc)
+            raise primary_exc
 
 
 def mp3_to_wav_bytes(mp3_bytes: bytes) -> bytes:

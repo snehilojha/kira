@@ -92,19 +92,26 @@ def _ddg_news() -> str:
     except ImportError:
         from duckduckgo_search import DDGS
 
+    queries = [
+        ("AI artificial intelligence news today", 4),
+        ("global financial markets news today", 3),
+        ("world news today", 3),
+        ("India stock market today", 3),
+    ]
     headlines: list[str] = []
-    queries = ["India stock market today", "Indian economy news today"]
+    seen: set[str] = set()
     try:
         with DDGS() as ddgs:
-            for query in queries:
-                for hit in ddgs.news(query, max_results=4):
+            for query, n in queries:
+                for hit in ddgs.news(query, max_results=n):
                     title = (hit.get("title") or "").strip()
-                    if title and title not in headlines:
+                    if title and title.lower() not in seen:
                         headlines.append(title)
+                        seen.add(title.lower())
     except Exception as exc:
         logger.warning("News fetch failed: %s", exc)
 
-    return "\n".join(f"- {h}" for h in headlines[:8])
+    return "\n".join(f"- {h}" for h in headlines[:15])
 
 
 def _fetch_stocks() -> dict:

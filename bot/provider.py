@@ -4,8 +4,16 @@ Centralises client creation, model role lookup, and provider configuration
 so handlers and background tasks do not construct API clients directly.
 
 TTS uses its own provider settings (KIRA_TTS_API_KEY / KIRA_TTS_BASE_URL)
-so you can route TTS to a different provider (e.g. OpenRouter) while keeping
-chat/vision on OpenAI — or use the same provider for everything.
+so you can route TTS to a different provider (e.g. Baseten/Orpheus) while
+keeping chat/vision on OpenAI or OpenRouter.
+
+STT uses its own provider settings (KIRA_STT_API_KEY / KIRA_STT_BASE_URL)
+so Whisper/gpt-4o-transcribe can stay on OpenAI while chat routes through
+OpenRouter — OpenRouter does not support /audio/transcriptions.
+
+Vision uses its own provider settings (KIRA_VISION_API_KEY / KIRA_VISION_BASE_URL)
+so you can route vision to a different provider (e.g. Gemini via OpenRouter)
+while keeping chat on OpenAI — or leave unset to share the main provider.
 """
 
 from __future__ import annotations
@@ -17,7 +25,7 @@ from typing import Any
 _DEFAULT_FAST_MODEL = "gpt-4o-mini"
 _DEFAULT_SMART_MODEL = "gpt-4o-mini"
 _DEFAULT_VISION_MODEL = "gpt-4o-mini"
-_DEFAULT_VOICE_TRANSCRIBE_MODEL = "whisper-1"
+_DEFAULT_VOICE_TRANSCRIBE_MODEL = "gpt-4o-transcribe"
 _DEFAULT_VOICE_SYNTHESISE_MODEL = "tts-1-hd"
 
 
@@ -42,6 +50,24 @@ class TTSConfig:
     base_url: str | None
     model: str
     voice: str
+
+
+@dataclass(frozen=True)
+class STTConfig:
+    """Separate provider config for STT — always defaults to OpenAI (OpenRouter lacks /audio/transcriptions)."""
+
+    api_key: str
+    base_url: str | None
+    model: str
+
+
+@dataclass(frozen=True)
+class VisionConfig:
+    """Separate provider config for vision — can point to a different provider (e.g. Gemini via OpenRouter)."""
+
+    api_key: str
+    base_url: str | None
+    model: str
 
 
 def load_config() -> ProviderConfig:
@@ -76,6 +102,44 @@ def load_config() -> ProviderConfig:
             "KIRA_VOICE_SYNTHESISE_MODEL", _DEFAULT_VOICE_SYNTHESISE_MODEL
         ),
     )
+
+
+def load_stt_config() -> STTConfig:
+    """Resolve STT-specific provider settings.
+
+    Always defaults to OpenAI since OpenRouter doesn't support /audio/transcriptions.
+
+    .env keys:
+        KIRA_STT_API_KEY   — STT provider API key (falls back to OPENAI_API_KEY then main key)
+        KIRA_STT_BASE_URL  — STT provider base URL (leave unset to use OpenAI default)
+        KIRA_VOICE_TRANSCRIBE_MODEL — transcription model (default: gpt-4o-transcribe)
+    """
+    main = load_config()
+    api_key = (
+        os.environ.get("KIRA_STT_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or main.api_key
+    )
+    base_url = os.environ.get("KIRA_STT_BASE_URL") or None
+    model = os.environ.get("KIRA_VOICE_TRANSCRIBE_MODEL", _DEFAULT_VOICE_TRANSCRIBE_MODEL)
+    return STTConfig(api_key=api_key, base_url=base_url, model=model)
+
+
+def load_vision_config() -> VisionConfig:
+    """Resolve vision-specific provider settings.
+
+    Falls back to the main provider config if no vision-specific settings are set.
+
+    .env keys:
+        KIRA_VISION_API_KEY   — vision provider API key (falls back to main key)
+        KIRA_VISION_BASE_URL  — vision provider base URL (e.g. https://openrouter.ai/api/v1)
+        KIRA_VISION_MODEL     — vision model ID
+    """
+    main = load_config()
+    api_key = os.environ.get("KIRA_VISION_API_KEY") or main.api_key
+    base_url = os.environ.get("KIRA_VISION_BASE_URL") or main.base_url
+    model = os.environ.get("KIRA_VISION_MODEL", _DEFAULT_VISION_MODEL)
+    return VisionConfig(api_key=api_key, base_url=base_url, model=model)
 
 
 def load_tts_config() -> TTSConfig:
@@ -130,6 +194,34 @@ def create_client() -> Any:
     return AsyncOpenAI(**kwargs)
 
 
+def create_vision_client() -> Any:
+    """Create an async OpenAI-compatible client for vision (may be a different provider)."""
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as exc:
+        raise ImportError("openai package not installed. Run: pip install openai") from exc
+
+    vision = load_vision_config()
+    kwargs: dict[str, Any] = {"api_key": vision.api_key}
+    if vision.base_url:
+        kwargs["base_url"] = vision.base_url
+    return AsyncOpenAI(**kwargs)
+
+
+def create_stt_client() -> Any:
+    """Create an async OpenAI client for STT — always targets OpenAI, not OpenRouter."""
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as exc:
+        raise ImportError("openai package not installed. Run: pip install openai") from exc
+
+    stt = load_stt_config()
+    kwargs: dict[str, Any] = {"api_key": stt.api_key}
+    if stt.base_url:
+        kwargs["base_url"] = stt.base_url
+    return AsyncOpenAI(**kwargs)
+
+
 def create_tts_client() -> Any:
     """Create an async OpenAI-compatible client for TTS (may be a different provider)."""
     try:
@@ -164,10 +256,11 @@ async def create_chat_completion(
 
 
 async def transcribe_audio(*, file: Any, language: str = "en", **kwargs: Any) -> Any:
-    """Run speech-to-text using the configured transcription model."""
-    client = create_client()
+    """Run speech-to-text using the STT provider (always OpenAI — OpenRouter lacks this endpoint)."""
+    stt = load_stt_config()
+    client = create_stt_client()
     return await client.audio.transcriptions.create(
-        model=get_model("voice_transcribe"),
+        model=stt.model,
         file=file,
         language=language,
         **kwargs,
@@ -178,13 +271,17 @@ async def synthesise_speech(*, text: str, voice: str, response_format: str = "mp
     """Run text-to-speech using the TTS provider (may differ from chat provider)."""
     tts = load_tts_config()
     client = create_tts_client()
-    return await client.audio.speech.create(
+    call_kwargs: dict[str, Any] = dict(
         model=tts.model,
         voice=voice,
         input=text,
         response_format=response_format,
         **kwargs,
     )
+    instructions = os.environ.get("KIRA_TTS_INSTRUCTIONS")
+    if instructions and ("mini-tts" in tts.model or "4o" in tts.model):
+        call_kwargs["instructions"] = instructions
+    return await client.audio.speech.create(**call_kwargs)
 
 
 async def create_vision_completion(
@@ -195,7 +292,8 @@ async def create_vision_completion(
     image_format: str = "png",
 ) -> Any:
     """Send an image to the vision model and return the completion response."""
-    client = create_client()
+    vision = load_vision_config()
+    client = create_vision_client()
     mime = f"image/{image_format}"
     messages = [
         {
@@ -210,7 +308,7 @@ async def create_vision_completion(
         }
     ]
     return await client.chat.completions.create(
-        model=get_model("vision"),
+        model=vision.model,
         messages=messages,
         max_tokens=max_tokens,
         temperature=0.1,

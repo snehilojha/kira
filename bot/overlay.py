@@ -190,7 +190,7 @@ class _LeftPanel(QWidget):
     def _fetch_and_set_sys(self) -> None:
         """All blocking I/O runs here on a background thread."""
         try:
-            import psutil, subprocess as _sp
+            import psutil
 
             cpu = psutil.cpu_percent()
             vm  = psutil.virtual_memory()
@@ -203,12 +203,13 @@ class _LeftPanel(QWidget):
                 disk_str = "N/A"
 
             try:
-                out = _sp.check_output(
-                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
-                     "--format=csv,noheader,nounits"],
-                    timeout=1, stderr=_sp.DEVNULL,
-                ).decode().strip().split(",")
-                gpu_str = f"{out[0].strip()}%  {int(out[1].strip())}/{int(out[2].strip())} MB"
+                import GPUtil as _GPUtil
+                gpus = _GPUtil.getGPUs()
+                if gpus:
+                    g = gpus[0]
+                    gpu_str = f"{g.load*100:.0f}%  {g.memoryUsed:.0f}/{g.memoryTotal:.0f} MB"
+                else:
+                    gpu_str = "N/A"
             except Exception:
                 gpu_str = "N/A"
 
@@ -328,6 +329,7 @@ class _RightPanel(QWidget):
         you_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         you_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         you_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}"
+                                 "QScrollArea > QWidget > QWidget{background:transparent;}"
                                  "QScrollBar:vertical{width:3px;background:transparent;}"
                                  "QScrollBar::handle:vertical{background:rgba(140,100,255,80);border-radius:1px;}"
                                  "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0px;}")
@@ -348,6 +350,7 @@ class _RightPanel(QWidget):
         kira_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         kira_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         kira_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}"
+                                  "QScrollArea > QWidget > QWidget{background:transparent;}"
                                   "QScrollBar:vertical{width:3px;background:transparent;}"
                                   "QScrollBar::handle:vertical{background:rgba(140,100,255,80);border-radius:1px;}"
                                   "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0px;}")
@@ -537,6 +540,7 @@ class _KiraOverlay(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
+            | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
@@ -648,6 +652,7 @@ class _KiraOverlay(QWidget):
             return
         self._full_mode = on
         if on:
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
             self._dot.hide()
             self._apply_full_geometry()
             self._orb_full.show()
@@ -658,6 +663,7 @@ class _KiraOverlay(QWidget):
             self.show()
             self._fade_to(1.0)
         else:
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             self._orb_full.hide()
             self._left.hide()
             self._right.hide()
