@@ -298,24 +298,26 @@ class _RightPanel(QWidget):
         self._you = QLabel("—")
         self._you.setWordWrap(True)
         self._you.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self._you.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding)
-        self._you.setStyleSheet("color:rgba(200,190,230,165);font-size:11px;")
+        self._you.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self._you.setMinimumHeight(36)
+        self._you.setStyleSheet("color:rgba(220,210,245,210);font-size:12px;")
         you_card.body().addWidget(self._you)
         v.addWidget(you_card)
 
-        # ── Kira card
+        # ── Kira card — expands to fill remaining space
         kira_card = _Card("Kira", self)
+        kira_card.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._kira = QLabel("Ready.")
         self._kira.setWordWrap(True)
         self._kira.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self._kira.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.MinimumExpanding)
-        self._kira.setStyleSheet("color:rgba(140,100,200,130);font-size:11px;")
+        self._kira.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self._kira.setMinimumHeight(120)
+        self._kira.setStyleSheet("color:rgba(180,150,240,200);font-size:12px;line-height:1.5;")
         self._action = QLabel("")
         self._action.setStyleSheet("color:rgba(160,100,255,70);font-size:7px;letter-spacing:3px;")
-        kira_card.body().addWidget(self._kira)
+        kira_card.body().addWidget(self._kira, stretch=1)
         kira_card.body().addWidget(self._action)
-        v.addWidget(kira_card)
-        v.addStretch()
+        v.addWidget(kira_card, stretch=1)
 
         # Fetch weather once immediately on a thread, then refresh every 10 min
         self._refresh_weather()
@@ -344,15 +346,15 @@ class _RightPanel(QWidget):
 
     def set_state(self, state: OrbState) -> None:
         actions = {
-            "idle":       ("", "rgba(140,100,200,130)"),
-            "listening":  ("recording audio", "rgba(140,100,200,130)"),
-            "thinking":   ("calling brain...", "rgba(140,100,200,130)"),
-            "speaking":   ("synthesising speech", "rgba(200,160,255,242)"),
-            "autonomous": ("watching for changes", "rgba(100,70,160,128)"),
+            "idle":       ("", "rgba(180,150,240,200)"),
+            "listening":  ("recording audio", "rgba(180,150,240,200)"),
+            "thinking":   ("calling brain...", "rgba(180,150,240,200)"),
+            "speaking":   ("synthesising speech", "rgba(220,190,255,255)"),
+            "autonomous": ("watching for changes", "rgba(140,110,200,180)"),
         }
-        action, color = actions.get(state, ("", "rgba(140,100,200,130)"))
+        action, color = actions.get(state, ("", "rgba(180,150,240,200)"))
         self._action.setText(action.upper() if action else "")
-        self._kira.setStyleSheet(f"color:{color};font-size:11px;")
+        self._kira.setStyleSheet(f"color:{color};font-size:12px;")
 
 
 # ═══════════════════════════════════════════════════════════════════

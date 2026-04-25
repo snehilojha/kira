@@ -53,9 +53,27 @@ ConfirmCallback = Callable[[str], Awaitable[bool]]
 # Rolling history of the last 5 voice commands (transcript, result message)
 _command_history: collections.deque[tuple[str, str]] = collections.deque(maxlen=5)
 
+# Persistent in-session conversation history for LLM context (max 16 messages = 8 turns)
+_session_history: list[dict] = []
+_SESSION_HISTORY_MAX = 16
+
 # HWND of the window that was in focus just before Kira started listening.
 # Restored before desktop control actions so keystrokes/scroll hit the right app.
 _last_user_hwnd: int = 0
+
+
+def clear_session_history() -> None:
+    """Clear the in-session conversation history. Call on session end / stand-down."""
+    global _session_history
+    _session_history = []
+
+
+def _append_session_history(user_text: str, assistant_text: str) -> None:
+    global _session_history
+    _session_history.append({"role": "user", "content": user_text})
+    _session_history.append({"role": "assistant", "content": assistant_text})
+    if len(_session_history) > _SESSION_HISTORY_MAX:
+        _session_history = _session_history[-_SESSION_HISTORY_MAX:]
 
 
 def _capture_foreground_hwnd() -> int:
@@ -452,9 +470,16 @@ _CONVERSATIONAL = {
 
 # Prefixes that signal a slow external lookup is needed
 _SEARCH_PREFIXES = (
-    "search", "look up", "look up", "find out", "google",
+    "search", "look up", "find out", "google",
     "what's the latest", "what is the latest", "any news",
     "what's happening", "what is happening",
+)
+
+# Prefixes that suggest a factual / time-sensitive question needing the smart model
+_FACTUAL_PREFIXES = (
+    "what's the", "what is the", "who is", "who was", "when did",
+    "when is", "where is", "where was", "how much", "how many",
+    "how long", "what happened", "tell me about", "explain",
 )
 
 
@@ -491,15 +516,38 @@ def _pick_filler(transcript: str) -> str:
 
     # Everything else goes to the LLM — only filler if it looks like
     # a factual/current-data query, not a conversational one.
-    factual_prefixes = (
-        "what's the", "what is the", "who is", "who was", "when did",
-        "when is", "where is", "where was", "how much", "how many",
-        "how long", "what happened", "tell me about", "explain",
-    )
-    if any(normalized.startswith(p) for p in factual_prefixes):
+    if any(normalized.startswith(p) for p in _FACTUAL_PREFIXES):
         return "Let me check."
 
     return ""
+
+
+def _pick_model(transcript: str, config) -> str:
+    """Return fast_model or smart_model based on query complexity.
+
+    fast  — conversational, follow-ups, simple opinion questions
+    smart — explicit searches, time-sensitive data, complex factual queries
+    """
+    normalized = _normalize_text(transcript)
+
+    # Clearly conversational — fast model is more than enough
+    if normalized in _CONVERSATIONAL:
+        return config.fast_model
+
+    # Explicit search / web lookup — needs smart for quality synthesis
+    if any(normalized.startswith(p) for p in _SEARCH_PREFIXES):
+        return config.smart_model
+
+    # Complex factual questions — smart
+    if any(normalized.startswith(p) for p in _FACTUAL_PREFIXES):
+        return config.smart_model
+
+    # Follow-up questions (short, referencing session history) — fast is fine
+    if _session_history and len(normalized.split()) <= 8:
+        return config.fast_model
+
+    # Default: smart for anything ambiguous
+    return config.smart_model
 
 
 def _history_context() -> str:
@@ -584,6 +632,7 @@ async def handle_transcript(
 
     result = await _handle_with_brain(transcript)
     _command_history.append((transcript, result.message[:80]))
+    _append_session_history(transcript, result.spoken)
     return None, result
 
 
@@ -609,6 +658,10 @@ async def _handle_webcam_intent(transcript: str) -> LocalVoiceResult | None:
         "- If the camera is CLOSED and the user asks something visual about themselves or something\n"
         "  they're holding/showing, intent should be \"open\" (it will open then query).\n"
         "- If the camera is OPEN and the user asks a visual question, intent is \"query\".\n"
+        "- If the camera is OPEN and the user makes a clarifying statement about who they are\n"
+        "  (e.g. 'it's me', 'that's me', 'I'm Snehil', 'I'm the user'), treat as \"query\"\n"
+        "  with the query 'The user just said: <their statement>. Acknowledge them by name and\n"
+        "  describe what you see in the camera now that you know who it is.'\n"
         "- 'query' field: the natural language question to ask the vision model (empty for open/close).\n"
         "Examples:\n"
         "  'can you see me' → {\"intent\":\"open\",\"query\":\"\"}\n"
@@ -616,6 +669,8 @@ async def _handle_webcam_intent(transcript: str) -> LocalVoiceResult | None:
         "  'what am I holding' → {\"intent\":\"open\",\"query\":\"What is the person holding?\"}\n"
         "  'guess the price of this' → {\"intent\":\"open\",\"query\":\"What product is this and what might it cost?\"}\n"
         "  'what do you see' → {\"intent\":\"query\",\"query\":\"Describe what you see.\"}\n"
+        "  'it\\'s me, the user' → {\"intent\":\"query\",\"query\":\"The user just confirmed it's them. Acknowledge them and describe what you see.\"}\n"
+        "  'that\\'s me' → {\"intent\":\"query\",\"query\":\"The user confirmed it's them. Acknowledge them and describe what you see.\"}\n"
         "  'close the camera' → {\"intent\":\"close\",\"query\":\"\"}\n"
         "  'ok stop' → {\"intent\":\"close\",\"query\":\"\"}\n"
         "  'what's the weather' → {\"intent\":\"none\",\"query\":\"\"}\n"
@@ -1118,15 +1173,17 @@ async def _handle_with_brain(transcript: str) -> LocalVoiceResult:
     if screen_context:
         user_content = f"{transcript}\n\n[Screen context: {screen_context}]"
 
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_content},
-    ]
+    messages = (
+        [{"role": "system", "content": system}]
+        + _session_history
+        + [{"role": "user", "content": user_content}]
+    )
 
+    selected_model = _pick_model(transcript, config)
     try:
         for _ in range(3):
             response = await client.chat.completions.create(
-                model=config.smart_model,
+                model=selected_model,
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
@@ -1239,6 +1296,7 @@ async def run_capture_once(
         _ui_mode.activate("voice command")
     elif any(p in _lower for p in ("stand down", "deactivate", "exit full", "compact mode")):
         _ui_mode.deactivate("voice command")
+        clear_session_history()
 
     overlay.set_transcript(transcript, "")
 

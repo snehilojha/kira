@@ -122,10 +122,26 @@ async def query(question: str) -> str:
     if not image_b64:
         return "I couldn't grab a frame from the camera. Is the webcam connected?"
 
-    prompt = question.strip() or (
+    from bot import identity as _identity
+    user_name = _identity.get_user_name()
+    user_facts = _identity.get_all_facts()
+
+    identity_context = ""
+    if user_name or user_facts:
+        parts = []
+        if user_name:
+            parts.append(f"The person in front of the camera is {user_name}, the user.")
+        if user_facts:
+            parts.append("What you know about them: " + " ".join(
+                f"{f}." if not f.endswith(".") else f for f in user_facts[:4]
+            ))
+        identity_context = " ".join(parts) + " "
+
+    base_question = question.strip() or (
         "Describe what you see in this image in 2-3 sentences. "
         "Focus on the main subject and any notable details."
     )
+    prompt = identity_context + base_question
 
     try:
         from bot import provider
@@ -133,6 +149,7 @@ async def query(question: str) -> str:
             prompt=prompt,
             image_b64=image_b64,
             max_tokens=300,
+            image_format="jpeg",
         )
         return (response.choices[0].message.content or "").strip()
     except Exception as exc:

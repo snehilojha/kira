@@ -21,11 +21,11 @@ from PyQt6.QtWidgets import QWidget
 OrbState = Literal["idle", "listening", "thinking", "speaking", "autonomous"]
 
 _STATE_ENERGY: dict[OrbState, float] = {
-    "idle":       0.18,
-    "listening":  0.72,
-    "thinking":   0.50,
-    "speaking":   0.95,
-    "autonomous": 0.09,
+    "idle":       0.32,
+    "listening":  0.80,
+    "thinking":   0.60,
+    "speaking":   0.98,
+    "autonomous": 0.20,
 }
 
 
@@ -76,8 +76,8 @@ class OrbRenderer(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
 
-        self._energy        = 0.18
-        self._target_energy = 0.18
+        self._energy        = 0.32
+        self._target_energy = 0.32
         self._speaking      = False
         self._t             = 0
         self._rot_y         = 0.0
@@ -151,50 +151,54 @@ class OrbRenderer(QWidget):
         # ── Shell falloff: bright at silhouette, dark at centre
         abs_z    = np.abs(rz)
         edgeness = 1.0 - abs_z
-        shell    = np.power(np.clip(edgeness, 0, 1), 2.2)   # sharper falloff = thinner shell
-        interior = np.where(abs_z > 0.5, (abs_z - 0.5) * 0.04 * energy, 0.0)
-        alpha_arr = np.clip(shell * (0.45 + energy * 0.40) + interior, 0, 1)
-        # Smaller dots — max ~1.2px at silhouette
-        size_arr  = 0.25 + shell * (0.95 + energy * 0.55)
+        shell    = np.power(np.clip(edgeness, 0, 1), 1.8)   # softer falloff = more visible shell
+        interior = np.where(abs_z > 0.4, (abs_z - 0.4) * 0.08 * energy, 0.0)
+        alpha_arr = np.clip(shell * (0.65 + energy * 0.35) + interior, 0, 1)
+        # Slightly larger dots for visibility
+        size_arr  = 0.35 + shell * (1.1 + energy * 0.6)
 
-        # ── Monochrome: brightness varies with shell + depth
-        brightness = np.clip(180 + (shell * 75).astype(np.int32), 0, 255)
+        # ── Purple-white tint: edge dots are bright white, interior has purple tint
+        bright_w = np.clip(210 + (shell * 45).astype(np.int32), 0, 255)  # white channel
+        tint_r   = np.clip(160 + (shell * 40).astype(np.int32), 0, 255)  # slight red (makes purple)
+        tint_b   = np.clip(230 + (shell * 25).astype(np.int32), 0, 255)  # boosted blue
 
         # ── Sort back-to-front by rz
         order = np.argsort((rz + 1.0) * 0.5)
 
-        # ── Outer aura (subtle, white)
-        aura = QRadialGradient(CX, CY, BASE_R * 1.5)
-        aura.setColorAt(0,   QColor(255, 255, 255, int(energy * 14)))
-        aura.setColorAt(0.5, QColor(220, 220, 255, int(energy * 6)))
+        # ── Outer aura (purple glow)
+        aura = QRadialGradient(CX, CY, BASE_R * 1.7)
+        aura.setColorAt(0,   QColor(180, 130, 255, int(energy * 40)))
+        aura.setColorAt(0.5, QColor(120,  80, 220, int(energy * 18)))
         aura.setColorAt(1,   QColor(0, 0, 0, 0))
         painter.setBrush(aura)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(
-            int(CX - BASE_R * 1.5), int(CY - BASE_R * 1.5),
-            int(BASE_R * 3.0),      int(BASE_R * 3.0),
+            int(CX - BASE_R * 1.7), int(CY - BASE_R * 1.7),
+            int(BASE_R * 3.4),      int(BASE_R * 3.4),
         )
 
         # ── Draw dots
         painter.setPen(Qt.PenStyle.NoPen)
         for i in order:
             a = float(alpha_arr[i])
-            if a < 0.04:
+            if a < 0.03:
                 continue
             sx_i = float(sx_arr[i])
             sy_i = float(sy_arr[i])
             s    = float(size_arr[i])
-            bv   = int(brightness[i])
+            rv   = int(tint_r[i])
+            gv   = int(bright_w[i])
+            bv   = int(tint_b[i])
 
-            # Soft glow halo only on bright edge dots
-            if a > 0.45 and s > 0.7:
-                gr = s * 2.8
-                painter.setBrush(QColor(bv, bv, bv, max(0, int(a * 12))))
+            # Glow halo on bright edge dots
+            if a > 0.40 and s > 0.6:
+                gr = s * 3.2
+                painter.setBrush(QColor(rv, gv, bv, max(0, int(a * 22))))
                 painter.drawEllipse(int(sx_i - gr), int(sy_i - gr),
                                     max(1, int(gr * 2)), max(1, int(gr * 2)))
 
-            painter.setBrush(QColor(bv, bv, bv, max(0, int(a * 255))))
-            r2 = max(0.4, s)
+            painter.setBrush(QColor(rv, gv, bv, max(0, int(a * 255))))
+            r2 = max(0.5, s)
             painter.drawEllipse(int(sx_i - r2), int(sy_i - r2),
                                 max(1, int(r2 * 2)), max(1, int(r2 * 2)))
 

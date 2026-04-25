@@ -146,18 +146,21 @@ async def create_vision_completion(
     prompt: str,
     image_b64: str,
     max_tokens: int = 300,
+    image_format: str = "png",
 ) -> Any:
-    """Send a screenshot to the vision model and return the completion response.
+    """Send an image to the vision model and return the completion response.
 
     Args:
         prompt: Text instruction for the vision model.
-        image_b64: Base64-encoded PNG screenshot (no data-URI prefix needed).
+        image_b64: Base64-encoded image bytes (no data-URI prefix needed).
         max_tokens: Maximum tokens for the response.
+        image_format: MIME sub-type — "png" or "jpeg". Defaults to "png".
 
     Returns:
         The raw OpenAI-compatible completion response object.
     """
     client = create_client()
+    mime = f"image/{image_format}"
     messages = [
         {
             "role": "user",
@@ -165,7 +168,7 @@ async def create_vision_completion(
                 {"type": "text", "text": prompt},
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    "image_url": {"url": f"data:{mime};base64,{image_b64}"},
                 },
             ],
         }
