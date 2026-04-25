@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import subprocess
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -39,15 +40,52 @@ _GPT_MODEL = "gpt-4o-mini"
 
 # Seconds with no new log output before a process is considered potentially stalled.
 _STALL_THRESHOLD_SECONDS = float(os.environ.get("KIRA_STALL_THRESHOLD_SECONDS", "300"))
+_FAST_LOOP_INTERVAL = 30  # seconds
+_HIGH_CPU_THRESHOLD = 90.0  # percent
+_HIGH_CPU_DURATION = 600    # seconds sustained before alerting
 
 # Module-level cached context string and raw snapshot.
 _CURRENT_CONTEXT_SUMMARY: str = ""
 _raw_snapshot_cache: dict = {}
 
+# Fast-loop state — tracks what has already been notified to avoid repeat pings
+_notified: set[str] = set()
+_high_cpu_since: dict[int, float] = {}
+_low_cpu_since: dict[int, float] = {}
+_LOW_CPU_STDIN_DURATION = int(os.environ.get("KIRA_STDIN_DETECT_SECONDS", "120"))
+
+# Absence log — records escalation events that fired during autonomous mode.
+# Cleared when the user returns. Read by mode.py for the return summary.
+_absence_log: list[str] = []
+
+
+def get_absence_log() -> list[str]:
+    """Return escalation events that fired during the current autonomous period."""
+    return list(_absence_log)
+
+
+def clear_absence_log() -> None:
+    """Clear the absence log. Called by mode.py when user returns."""
+    _absence_log.clear()
+
 
 def get_current_context() -> str:
     """Return the latest GPT-summarised machine context, or empty string if not ready."""
     return _CURRENT_CONTEXT_SUMMARY
+
+
+# ── Active project context cache ──────────────────────────────────
+
+# Keyed by project folder path string → summary string
+_project_context_cache: dict[str, str] = {}
+# Last window title we parsed — avoid recomputing on every brain call
+_last_foreground_title: str = ""
+_active_project_context: str = ""
+
+
+def get_active_project_context() -> str:
+    """Return the pre-emptive context for the project currently in focus."""
+    return _active_project_context
 
 
 def get_pending_triggers() -> list[str]:
@@ -100,6 +138,184 @@ async def start() -> None:
         await asyncio.sleep(_OBSERVER_INTERVAL)
 
 
+async def start_fast_loop() -> None:
+    """Fast escalation loop — checks urgent conditions every 30 seconds."""
+    logger.info("Observer fast loop started (interval=%ds)", _FAST_LOOP_INTERVAL)
+    while True:
+        try:
+            await _run_fast_cycle()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Observer fast cycle failed")
+        await asyncio.sleep(_FAST_LOOP_INTERVAL)
+
+
+async def _run_fast_cycle() -> None:
+    """Check urgent conditions and ping Telegram if something needs attention."""
+    from bot import mode as kira_mode
+    from bot import notifier
+
+    # Always update low-cpu timers regardless of autonomous state,
+    # so the stdin detection clock starts from when the process went idle,
+    # not from when the user walked away.
+    await asyncio.to_thread(_update_process_timers)
+
+    # Keep active project context fresh on every fast tick
+    title = await asyncio.to_thread(_collect_foreground_window)
+    if title:
+        await _refresh_active_project_context(title)
+
+    autonomous = kira_mode.is_autonomous()
+    logger.debug("Fast cycle: autonomous=%s", autonomous)
+    if not autonomous:
+        # User is back — clear notifications so they can re-fire next absence.
+        _notified.clear()
+        return
+
+    # Remove stale notified keys for pids that no longer exist.
+    live_pids = {p["pid"] for p in _collect_watched_procs()}
+    stale = {k for k in _notified if "_" in k and k.split("_")[1].isdigit()
+             and int(k.split("_")[1]) not in live_pids}
+    _notified.difference_update(stale)
+
+    events = await asyncio.to_thread(_collect_fast_snapshot)
+    logger.debug("Fast cycle: %d events found", len(events))
+    for event_key, message in events:
+        if event_key in _notified:
+            continue
+        _notified.add(event_key)
+        logger.info("Escalating to Telegram: %s", event_key)
+        _absence_log.append(message)
+        try:
+            png = await asyncio.to_thread(_get_screenshot_bytes)
+            caption = f"Kira: {message}"
+            if png:
+                await notifier.send_photo(caption, png)
+            else:
+                await notifier.send(caption)
+        except Exception as exc:
+            logger.warning("Escalation notify failed: %s", exc)
+
+
+_WATCHED_PROCESS_NAMES = {"python.exe", "pythonw.exe", "code.exe"}
+_MIN_RUNTIME_SECONDS = 60  # ignore quick one-off processes
+
+
+def _collect_watched_procs() -> list[dict]:
+    """Return user-owned Python and VSCode processes running longer than 60s."""
+    try:
+        import psutil
+    except ImportError:
+        return []
+
+    procs = []
+    current_user = None
+    try:
+        current_user = psutil.Process().username()
+    except Exception:
+        pass
+
+    for ps in psutil.process_iter(["pid", "name", "username", "create_time", "cmdline", "status"]):
+        try:
+            info = ps.info
+            if info["name"] not in _WATCHED_PROCESS_NAMES:
+                continue
+            if current_user and info.get("username") != current_user:
+                continue
+            runtime = time.time() - (info["create_time"] or time.time())
+            if runtime < _MIN_RUNTIME_SECONDS:
+                continue
+            cmdline = " ".join(info.get("cmdline") or [])
+            procs.append({
+                "pid": info["pid"],
+                "name": info["name"],
+                "cmdline": cmdline[:120],
+                "runtime_seconds": runtime,
+                "status": info.get("status", ""),
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    return procs
+
+
+def _update_process_timers() -> None:
+    """Update low/high CPU timers for all watched processes. Called every cycle."""
+    import psutil
+
+    watched = _collect_watched_procs()
+    live_pids = {p["pid"] for p in watched}
+
+    for pid in list(_high_cpu_since):
+        if pid not in live_pids:
+            _high_cpu_since.pop(pid, None)
+    for pid in list(_low_cpu_since):
+        if pid not in live_pids:
+            _low_cpu_since.pop(pid, None)
+
+    for proc in watched:
+        pid = proc["pid"]
+        runtime = proc["runtime_seconds"]
+        try:
+            ps = psutil.Process(pid)
+            cpu = ps.cpu_percent(interval=0.5)
+            if cpu < 1.0 and runtime > 60:
+                _low_cpu_since.setdefault(pid, time.monotonic())
+            else:
+                _low_cpu_since.pop(pid, None)
+
+            if cpu >= _HIGH_CPU_THRESHOLD:
+                _high_cpu_since.setdefault(pid, time.monotonic())
+            else:
+                _high_cpu_since.pop(pid, None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            _low_cpu_since.pop(pid, None)
+            _high_cpu_since.pop(pid, None)
+
+
+def _collect_fast_snapshot() -> list[tuple[str, str]]:
+    """Collect urgent events to ping about. Timers already updated by _update_process_timers."""
+    watched = _collect_watched_procs()
+    events: list[tuple[str, str]] = []
+    now = time.monotonic()
+
+    for proc in watched:
+        pid = proc["pid"]
+        label = proc["cmdline"] or proc["name"]
+
+        # Stdin blocked
+        since = _low_cpu_since.get(pid)
+        if since and now - since >= _LOW_CPU_STDIN_DURATION:
+            events.append((f"stdin_{pid}", f"A script may be waiting for input: {label}"))
+
+        # High CPU sustained
+        since = _high_cpu_since.get(pid)
+        if since and now - since >= _HIGH_CPU_DURATION:
+            events.append((f"highcpu_{pid}", f"A script has been pegging CPU for over {_HIGH_CPU_DURATION // 60} minutes: {label}"))
+
+    # Dialog / UAC
+    dialog = _collect_dialog_state()
+    if dialog:
+        events.append(("dialog", f"A dialog appeared on screen: {dialog}"))
+
+    return events
+
+
+def _get_screenshot_bytes() -> bytes:
+    """Take a screenshot and return raw PNG bytes."""
+    try:
+        import mss
+        import mss.tools
+        with mss.mss() as sct:
+            monitor = sct.monitors[0]  # 0 = all monitors combined
+            shot = sct.grab(monitor)
+            return mss.tools.to_png(shot.rgb, shot.size)
+    except Exception as exc:
+        logger.warning("Screenshot failed: %s", exc)
+        return b""
+
+
 async def _run_cycle() -> None:
     """Collect a snapshot, persist it, update the cached summary, dispatch triggers."""
     global _CURRENT_CONTEXT_SUMMARY, _raw_snapshot_cache
@@ -117,7 +333,13 @@ async def _run_cycle() -> None:
     _CURRENT_CONTEXT_SUMMARY = summary
     logger.debug("Observer context updated (%d chars)", len(summary))
 
+    # Refresh active project context from current foreground window
+    title = snapshot.get("foreground_window", "")
+    if title:
+        await _refresh_active_project_context(title)
+
     await _dispatch_triggers()
+    await _maybe_proactive_notify(summary)
 
 
 # ── Snapshot collection ───────────────────────────────────────────
@@ -520,6 +742,192 @@ def _format_log_tails(tails: dict[str, str]) -> str:
         for line in tail.splitlines()[-10:]:
             lines.append(f"    {line}")
     return "\n".join(lines)
+
+
+# ── Active project detection ──────────────────────────────────────
+
+import re as _re
+
+# VSCode window title patterns (covers most common variants):
+#   "file.py — folder — Visual Studio Code"
+#   "● file.py — folder — Visual Studio Code"
+#   "folder — Visual Studio Code"
+_VSCODE_TITLE_RE = _re.compile(
+    r"^●?\s*(?:.+?\s+—\s+)?(.+?)\s+—\s+Visual Studio Code",
+    _re.IGNORECASE,
+)
+
+
+def _parse_project_from_title(title: str) -> Path | None:
+    """Extract a matching project root from a window title."""
+    m = _VSCODE_TITLE_RE.match(title)
+    if not m:
+        return None
+
+    folder_hint = m.group(1).strip()
+    roots = _get_project_roots()
+
+    # Try exact subfolder match first, then name-contains match
+    for root in roots:
+        try:
+            for candidate in [root, *root.iterdir()]:
+                if candidate.is_dir() and candidate.name.lower() == folder_hint.lower():
+                    return candidate
+        except OSError:
+            pass
+
+    # Fallback: check if any root name appears in the hint
+    for root in roots:
+        if root.name.lower() in folder_hint.lower():
+            return root
+
+    return None
+
+
+def _build_project_summary(folder: Path) -> str:
+    """Build a compact context string for a project folder."""
+    lines: list[str] = [f"Active project: {folder.name} ({folder})"]
+
+    # Recent git log
+    try:
+        log = subprocess.run(
+            ["git", "-C", str(folder), "log", "--oneline", "-5"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        branch = subprocess.run(
+            ["git", "-C", str(folder), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if branch:
+            lines.append(f"Branch: {branch}")
+        if log:
+            lines.append(f"Recent commits:\n{log}")
+    except Exception:
+        pass
+
+    # Recent modified files (last 6h)
+    try:
+        cutoff = datetime.now() - timedelta(hours=6)
+        _TRACK_EXTS = {".py", ".ipynb", ".yaml", ".yml", ".toml", ".json", ".md"}
+        _SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules"}
+        recent: list[str] = []
+        for p in folder.rglob("*"):
+            if not p.is_file():
+                continue
+            if any(part in _SKIP_DIRS for part in p.parts):
+                continue
+            if p.suffix.lower() not in _TRACK_EXTS:
+                continue
+            try:
+                if datetime.fromtimestamp(p.stat().st_mtime) >= cutoff:
+                    recent.append(str(p.relative_to(folder)))
+            except OSError:
+                continue
+            if len(recent) >= 10:
+                break
+        if recent:
+            lines.append("Recently modified:\n" + "\n".join(f"  {f}" for f in recent))
+    except Exception:
+        pass
+
+    # context.md if present
+    ctx_file = folder / "context.md"
+    if ctx_file.exists():
+        try:
+            text = ctx_file.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                lines.append(f"Project context:\n{text[:800]}")
+        except OSError:
+            pass
+
+    return "\n".join(lines)
+
+
+async def _refresh_active_project_context(title: str) -> None:
+    """Detect active project from window title and update the context cache."""
+    global _last_foreground_title, _active_project_context
+
+    if title == _last_foreground_title:
+        return
+    _last_foreground_title = title
+
+    folder = await asyncio.to_thread(_parse_project_from_title, title)
+    if folder is None:
+        _active_project_context = ""
+        return
+
+    folder_key = str(folder)
+    if folder_key in _project_context_cache:
+        _active_project_context = _project_context_cache[folder_key]
+        return
+
+    summary = await asyncio.to_thread(_build_project_summary, folder)
+    _project_context_cache[folder_key] = summary
+    _active_project_context = summary
+    logger.info("Active project context loaded: %s", folder.name)
+
+
+# ── Proactive notification ────────────────────────────────────────
+
+_prev_summary: str = ""
+
+
+async def _maybe_proactive_notify(current_summary: str) -> None:
+    """Ask GPT if the new observer summary is notable enough to ping the user.
+
+    Only fires during autonomous mode. Compares against the previous summary
+    so repeated identical state doesn't keep pinging.
+    """
+    global _prev_summary
+
+    from bot import mode as kira_mode
+
+    if not kira_mode.is_autonomous():
+        _prev_summary = current_summary
+        return
+
+    if not current_summary or current_summary == _prev_summary:
+        return
+
+    prev = _prev_summary
+    _prev_summary = current_summary
+
+    if not prev:
+        return  # First cycle — no baseline to compare against
+
+    try:
+        response = await provider.create_chat_completion(
+            role="fast",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are deciding whether to interrupt a user who is away from their computer. "
+                        "You will be shown a before/after snapshot of their machine state. "
+                        "Reply with ONLY 'yes' if something genuinely notable changed that warrants interrupting them "
+                        "(e.g. a process crashed, a new unexpected file appeared, a long-running task finished, a git conflict). "
+                        "Reply with ONLY 'no' if the change is routine or unimportant. "
+                        "No explanation. One word."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Before:\n{prev}\n\nAfter:\n{current_summary}",
+                },
+            ],
+            max_tokens=5,
+            temperature=0.0,
+        )
+        verdict = response.choices[0].message.content.strip().lower()
+        logger.debug("Proactive notify verdict: %r", verdict)
+
+        if verdict.startswith("yes"):
+            from bot import notifier
+            _absence_log.append(f"Observer noticed: {current_summary[:200]}")
+            await notifier.send(f"Kira (proactive): {current_summary[:800]}")
+
+    except Exception as exc:
+        logger.debug("Proactive notify check failed: %s", exc)
 
 
 # ── GPT summarisation ─────────────────────────────────────────────

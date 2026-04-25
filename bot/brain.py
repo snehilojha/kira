@@ -128,6 +128,37 @@ async def build_execution_context(
     if observer_context:
         memory_context.append(f"Machine awareness:\n{observer_context}")
 
+    project_context = observer.get_active_project_context()
+    if project_context:
+        memory_context.append(project_context)
+
+    from bot import db as kira_db
+    from datetime import datetime
+    world_snapshot = await kira_db.get_recent_world_snapshot()
+    if world_snapshot:
+        import json as _json
+        parts = [f"Time: {datetime.now().strftime('%A, %d %B %Y, %H:%M')}"]
+        if world_snapshot.get("weather"):
+            parts.append(f"Weather: {world_snapshot['weather']}")
+        if world_snapshot.get("top_news"):
+            parts.append(f"News:\n{world_snapshot['top_news']}")
+        if world_snapshot.get("stocks"):
+            stocks = world_snapshot["stocks"]
+            if isinstance(stocks, str):
+                stocks = _json.loads(stocks)
+            indices = stocks.get("indices", {})
+            if indices:
+                idx_str = ", ".join(f"{k}: {v}" for k, v in indices.items())
+                parts.append(f"Markets: {idx_str}")
+            portfolio = stocks.get("portfolio", [])
+            if portfolio:
+                pf_lines = [
+                    f"  {p['ticker']}: ₹{p['price']} (P&L: ₹{p['pnl']}, {p['pnl_pct']}%)"
+                    for p in portfolio
+                ]
+                parts.append("Portfolio:\n" + "\n".join(pf_lines))
+        memory_context.append("World context:\n" + "\n".join(parts))
+
     current_mode = kira_mode.get_mode()
     state_snapshot = {
         "running_processes": process_registry.list_processes(),
@@ -487,6 +518,55 @@ class _WebSearchTool(BaseTool):
         return ToolResult.ok("\n\n".join(lines))
 
 
+def _readable_roots() -> list[Path]:
+    """Return paths Kira is allowed to read, from KIRA_READABLE_ROOTS env var."""
+    raw = os.environ.get("KIRA_READABLE_ROOTS", "").strip()
+    if not raw:
+        return []
+    return [Path(p.strip()).resolve() for p in raw.split(",") if p.strip()]
+
+
+class _KiraFileReadTool(BaseTool):
+    """FileReadTool extended to allow reads from KIRA_READABLE_ROOTS in addition to cwd."""
+
+    name = "file_read"
+    description = (
+        "Read the contents of a file. "
+        "Optionally specify offset (starting line) and limit (max lines) "
+        "for reading large files in chunks."
+    )
+
+    from astra_node.tools.file_read import FileReadInput
+    input_schema = FileReadInput
+    permission_level = PermissionLevel.ALWAYS_ALLOW
+
+    def execute(self, input, ctx: ToolContext) -> ToolResult:
+        from astra_node.tools.file_read import FileReadTool as _Base
+        import fnmatch
+
+        path = Path(input.path)
+        if not path.is_absolute():
+            path = ctx.cwd / path
+        path = path.resolve()
+
+        cwd_resolved = ctx.cwd.resolve()
+        extra_roots = _readable_roots()
+        allowed = [cwd_resolved] + extra_roots
+
+        if not any(path.is_relative_to(root) for root in allowed):
+            readable = ", ".join(str(r) for r in extra_roots) or "none configured"
+            return ToolResult.err(
+                f"Access denied: path is outside the working directory and readable roots "
+                f"(readable roots: {readable})"
+            )
+
+        # Delegate the actual read to the base tool's logic (blocked patterns, etc.)
+        # by temporarily pointing cwd to the matching root so is_relative_to passes.
+        matching_root = next(r for r in allowed if path.is_relative_to(r))
+        fake_ctx = ToolContext(cwd=matching_root)
+        return _Base().execute(input, fake_ctx)
+
+
 def _build_runtime_components(
     execution_context: ExecutionContext,
     *,
@@ -496,7 +576,6 @@ def _build_runtime_components(
     from astra_node.core.registry import ToolRegistry
     from astra_node.providers.openai import OpenAIProvider
     from astra_node.tools.bash import BashTool
-    from astra_node.tools.file_read import FileReadTool
     from astra_node.tools.glob_tool import GlobTool
     from astra_node.tools.grep import GrepTool
     from bot.check_tool import TestCommandRunTool
@@ -516,7 +595,7 @@ def _build_runtime_components(
 
     registry = ToolRegistry()
     for tool in (
-        FileReadTool(),
+        _KiraFileReadTool(),
         GrepTool(),
         GlobTool(),
         BashTool(),

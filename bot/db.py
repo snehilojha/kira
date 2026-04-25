@@ -56,6 +56,16 @@ async def init_db(db_path: Path | str | None = None) -> None:
 
     await _conn.executescript(_SCHEMA)
     await _conn.commit()
+
+    # Add columns introduced after initial schema (ALTER TABLE IF NOT EXISTS is not
+    # supported in older SQLite — catch the "duplicate column" error instead)
+    for col, typedef in [("weather", "TEXT"), ("stocks", "TEXT")]:
+        try:
+            await _conn.execute(f"ALTER TABLE world_snapshots ADD COLUMN {col} {typedef}")
+            await _conn.commit()
+        except Exception:
+            pass  # column already exists
+
     logger.info("Database initialised at %s", resolved)
 
 
@@ -145,7 +155,9 @@ CREATE TABLE IF NOT EXISTS world_snapshots (
     btc_price   REAL,
     eth_price   REAL,
     fear_greed  INTEGER,
-    top_news    TEXT
+    top_news    TEXT,
+    weather     TEXT,
+    stocks      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS monitor_jobs (
@@ -524,15 +536,22 @@ async def save_world_snapshot(snapshot: dict[str, Any]) -> int:
     if top_news is not None and not isinstance(top_news, str):
         top_news = _json.dumps(top_news)
 
+    weather = snapshot.get("weather")
+    stocks = snapshot.get("stocks")
+    if stocks is not None and not isinstance(stocks, str):
+        stocks = _json.dumps(stocks)
+
     conn = _get_conn()
     cursor = await conn.execute(
-        "INSERT INTO world_snapshots (btc_price, eth_price, fear_greed, top_news) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO world_snapshots (btc_price, eth_price, fear_greed, top_news, weather, stocks) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         (
             snapshot.get("btc_price"),
             snapshot.get("eth_price"),
             snapshot.get("fear_greed"),
             top_news,
+            weather,
+            stocks,
         ),
     )
     await conn.commit()

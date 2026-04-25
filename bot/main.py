@@ -19,6 +19,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 from bot import db
 from bot import handlers
 from bot import job_monitor
+from bot import local_voice
 from bot import memory
 from bot import mode
 from bot import monitor
@@ -27,6 +28,7 @@ from bot import notifier
 from bot import scheduler
 from bot import task_state
 from bot import watchdog
+from bot import world
 from bot.auth import load_allowed_users
 
 # ── Paths ─────────────────────────────────────────────────────────
@@ -141,8 +143,11 @@ def main() -> None:
         application.create_task(monitor.start_monitor())
         application.create_task(memory.start_daily_summariser())
         application.create_task(observer.start())
+        application.create_task(observer.start_fast_loop())
         application.create_task(job_monitor.start())
         application.create_task(mode.start())
+        application.create_task(world.start())
+        application.create_task(local_voice.start_as_task())
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
 
@@ -236,6 +241,15 @@ def main() -> None:
         MessageHandler(
             filters.VOICE & ~filters.CaptionRegex(r"(?i)^/putfile"),
             handlers.handle_voice,
+        )
+    )
+
+    # 8c. All plain text — reply handler checks if it's a ping reply first,
+    # falls through to conversation handler if not.
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handlers.handle_text,
         )
     )
 

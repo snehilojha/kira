@@ -53,6 +53,129 @@ ConfirmCallback = Callable[[str], Awaitable[bool]]
 # Rolling history of the last 5 voice commands (transcript, result message)
 _command_history: collections.deque[tuple[str, str]] = collections.deque(maxlen=5)
 
+# HWND of the window that was in focus just before Kira started listening.
+# Restored before desktop control actions so keystrokes/scroll hit the right app.
+_last_user_hwnd: int = 0
+
+
+def _capture_foreground_hwnd() -> int:
+    """Return the topmost visible non-Kira window handle (Windows only).
+
+    The Kira terminal is always in the foreground when the wake word fires,
+    so we walk the z-order to find the first window owned by a different process.
+    """
+    try:
+        import ctypes
+        import os as _os
+
+        GW_HWNDNEXT = 2
+        own_pid = _os.getpid()
+
+        hwnd = ctypes.windll.user32.GetTopWindow(0)
+        while hwnd:
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value != own_pid:
+                    # Verify it has a title (skip taskbar/tray shells)
+                    buf = ctypes.create_unicode_buffer(256)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+                    if buf.value.strip():
+                        logger.debug("Captured user window: %r (hwnd=%d)", buf.value, hwnd)
+                        return hwnd
+            hwnd = ctypes.windll.user32.GetWindow(hwnd, GW_HWNDNEXT)
+        return 0
+    except Exception:
+        return 0
+
+
+def _find_hwnd_from_transcript(transcript: str) -> int:
+    """Find a window handle by matching app keywords in the transcript."""
+    _APP_KEYWORDS = {
+        "chrome": "chrome",
+        "browser": "chrome",
+        "youtube": "youtube",
+        "firefox": "firefox",
+        "edge": "edge",
+        "spotify": "spotify",
+        "vscode": "visual studio code",
+        "visual studio": "visual studio code",
+        "notepad": "notepad",
+        "explorer": "explorer",
+        "terminal": "windows terminal",
+        "cmd": "cmd",
+    }
+    normalized = transcript.lower()
+    hint = None
+    for keyword, window_hint in _APP_KEYWORDS.items():
+        if keyword in normalized:
+            hint = window_hint
+            break
+    if not hint:
+        return 0
+    return _find_foreground_after_open(hint)
+
+
+def _find_foreground_after_open(app_hint: str) -> int:
+    """Find the hwnd of a recently opened app by matching its window title."""
+    try:
+        import ctypes
+        hint = app_hint.lower().strip()
+        GW_HWNDNEXT = 2
+        own_pid = __import__("os").getpid()
+        hwnd = ctypes.windll.user32.GetTopWindow(0)
+        while hwnd:
+            if ctypes.windll.user32.IsWindowVisible(hwnd):
+                pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value != own_pid:
+                    buf = ctypes.create_unicode_buffer(256)
+                    ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+                    title = buf.value.strip().lower()
+                    if title and (not hint or hint in title or "chrome" in title or "firefox" in title or "edge" in title):
+                        logger.debug("Found app window after open: %r (hwnd=%d)", buf.value, hwnd)
+                        return hwnd
+            hwnd = ctypes.windll.user32.GetWindow(hwnd, GW_HWNDNEXT)
+    except Exception:
+        pass
+    return 0
+
+
+def _restore_foreground(hwnd: int) -> None:
+    """Bring a window to the foreground using AttachThreadInput trick (Windows).
+
+    SetForegroundWindow alone silently fails when the calling process isn't
+    already in the foreground. Attaching to the foreground thread first
+    bypasses the restriction.
+    """
+    if not hwnd:
+        return
+    try:
+        import ctypes
+        import time
+
+        user32 = ctypes.windll.user32
+
+        # Get thread IDs
+        current_thread = ctypes.windll.kernel32.GetCurrentThreadId()
+        fg_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+
+        # Attach our thread to the foreground thread so we're allowed to steal focus
+        attached = False
+        if fg_thread and fg_thread != current_thread:
+            attached = user32.AttachThreadInput(current_thread, fg_thread, True)
+
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE — unminimize if needed
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+
+        if attached:
+            user32.AttachThreadInput(current_thread, fg_thread, False)
+
+        time.sleep(0.3)
+    except Exception as exc:
+        logger.debug("_restore_foreground failed: %s", exc)
+
 
 @dataclass(frozen=True)
 class ParsedCommand:
@@ -239,6 +362,9 @@ async def execute_command(
         message = _format_sysinfo()
         return LocalVoiceResult(ok=True, message=message, spoken="System info is ready.")
 
+    # Restore focus to the user's window before sending input so keystrokes/
+    # scroll/clicks land on the right app instead of the Kira terminal.
+    _restore_foreground(_last_user_hwnd)
     desktop_result = desktop_control.execute_command(parsed.command, parsed.args)
     if desktop_result is not None:
         return _from_action_result(desktop_result)
@@ -439,17 +565,21 @@ async def handle_transcript(
 
     apps_config = config or app_control.load_apps_config()
     parsed = parse_deterministic(transcript, apps_config)
-    if parsed is None:
-        parsed = await parse_with_llm(transcript)
-
-    if parsed is None:
-        result = await _handle_with_brain(transcript)
+    if parsed is not None:
+        result = await execute_command(parsed, confirm=confirm, config=apps_config)
         _command_history.append((transcript, result.message[:80]))
-        return None, result
+        return parsed, result
 
-    result = await execute_command(parsed, confirm=confirm, config=apps_config)
+    # For everything else: vision-based desktop action first (LLM sees screen,
+    # uses real coordinates). Falls through to brain for non-UI requests.
+    desktop_result = await _handle_desktop_action(transcript)
+    if desktop_result is not None:
+        _command_history.append((transcript, desktop_result.message[:80]))
+        return None, desktop_result
+
+    result = await _handle_with_brain(transcript)
     _command_history.append((transcript, result.message[:80]))
-    return parsed, result
+    return None, result
 
 
 async def _handle_multistep(transcript: str) -> LocalVoiceResult:
@@ -524,7 +654,7 @@ async def _handle_multistep(transcript: str) -> LocalVoiceResult:
         args = [str(a) for a in step.get("args", [])]
 
         if command == "/wait":
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(4.0)
             continue
 
         parsed = ParsedCommand(command=command, args=args, source="multistep", risky=is_risky_command(command, args))
@@ -532,12 +662,316 @@ async def _handle_multistep(transcript: str) -> LocalVoiceResult:
         messages.append(result.message)
 
         if command == "/open":
-            await asyncio.sleep(2.5)
+            await asyncio.sleep(4.0)
+            # After opening an app, update _last_user_hwnd to the new window
+            # so subsequent steps target the freshly opened app.
+            global _last_user_hwnd
+            new_hwnd = _find_foreground_after_open(args[0] if args else "")
+            if new_hwnd:
+                _last_user_hwnd = new_hwnd
         else:
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.5)
 
     spoken = "Done." if messages else "I could not complete that."
     return LocalVoiceResult(ok=True, message="\n".join(messages), spoken=spoken)
+
+
+async def _build_world_block() -> str:
+    """Return a compact world context string from the latest DB snapshot."""
+    import json as _json
+    from datetime import datetime
+    try:
+        snapshot = await db.get_recent_world_snapshot()
+    except Exception:
+        return ""
+    if not snapshot:
+        return ""
+
+    parts = [f"Time: {datetime.now().strftime('%A, %d %B %Y, %H:%M')}"]
+    if snapshot.get("weather"):
+        parts.append(f"Weather: {snapshot['weather']}")
+    if snapshot.get("top_news"):
+        parts.append(f"News:\n{snapshot['top_news']}")
+    if snapshot.get("stocks"):
+        stocks = snapshot["stocks"]
+        if isinstance(stocks, str):
+            stocks = _json.loads(stocks)
+        indices = stocks.get("indices", {})
+        if indices:
+            parts.append("Markets: " + ", ".join(f"{k}: {v}" for k, v in indices.items()))
+        portfolio = stocks.get("portfolio", [])
+        if portfolio:
+            pf_lines = [
+                f"  {p['ticker']}: ₹{p['price']} (P&L: ₹{p['pnl']}, {p['pnl_pct']}%)"
+                for p in portfolio if p.get("pnl_pct") != 0.0
+            ]
+            if pf_lines:
+                parts.append("Portfolio:\n" + "\n".join(pf_lines))
+    return "\n".join(parts)
+
+
+async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
+    """Try to execute a desktop action by giving the LLM a screenshot + tools.
+
+    Returns a LocalVoiceResult if the LLM took desktop actions, or None if
+    it decided the request isn't a desktop action (caller falls through to brain).
+    """
+    import base64
+    import openai as _openai
+
+    config = provider.load_config()
+    client = _openai.AsyncOpenAI(
+        api_key=config.api_key,
+        **({"base_url": config.base_url} if config.base_url else {}),
+    )
+
+    # Try to find a specific app window mentioned in the transcript,
+    # otherwise fall back to the last captured user window.
+    target_hwnd = _find_hwnd_from_transcript(transcript) or _last_user_hwnd
+    await asyncio.to_thread(_restore_foreground, target_hwnd)
+    await asyncio.sleep(0.5)  # let the OS actually switch before grabbing screen
+
+    # Take a screenshot so the LLM can see what's on screen
+    try:
+        png_bytes = await asyncio.to_thread(_get_screenshot_png)
+        screenshot_b64 = base64.b64encode(png_bytes).decode() if png_bytes else None
+    except Exception:
+        screenshot_b64 = None
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "click",
+                "description": "Click at screen coordinates.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "button": {"type": "string", "enum": ["left", "right", "middle"], "default": "left"},
+                        "clicks": {"type": "integer", "default": 1},
+                    },
+                    "required": ["x", "y"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "scroll",
+                "description": "Scroll at screen coordinates.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "integer"},
+                        "y": {"type": "integer"},
+                        "amount": {"type": "integer", "description": "Positive=up, negative=down"},
+                    },
+                    "required": ["x", "y", "amount"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "type_text",
+                "description": "Type text into the focused element.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "press_key",
+                "description": "Press a keyboard key (e.g. enter, space, tab, escape, playpause).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "key": {"type": "string"},
+                    },
+                    "required": ["key"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "hotkey",
+                "description": "Press a key combination (e.g. ctrl+t, alt+tab).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keys": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["keys"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "not_a_desktop_action",
+                "description": "Call this if the user request is NOT a desktop/UI action — it's a question or conversation.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "task_complete",
+                "description": "Call this when the task is fully done and no more actions are needed.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+    ]
+
+    user_content: list = [{"type": "text", "text": (
+        f"User said: {transcript}\n\n"
+        "Look at the screen and complete this action using the tools. "
+        "Do the MINIMUM actions needed — do not repeat actions. "
+        "Call task_complete as soon as the task is done. "
+        "If this is not a desktop action, call not_a_desktop_action."
+    )}]
+    if screenshot_b64:
+        user_content.insert(0, {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "low"},
+        })
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a desktop control assistant. You see the user's screen and execute UI actions.\n"
+                "Rules:\n"
+                "- Look at the screenshot to find where to click. Use exact coordinates.\n"
+                "- Do the MINIMUM actions needed. One click, one press — don't repeat.\n"
+                "- Call task_complete immediately after the action is done. Don't wait.\n"
+                "- Never click the same element twice unless explicitly asked.\n"
+                "- If the request is a question or conversation, call not_a_desktop_action."
+            ),
+        },
+        {"role": "user", "content": user_content},
+    ]
+
+    import pyautogui as _pag  # type: ignore
+    import base64 as _base64
+    actions_taken = []
+
+    try:
+        for _ in range(8):  # max 8 rounds
+            response = await client.chat.completions.create(
+                model=config.fast_model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                max_tokens=300,
+            )
+            msg = response.choices[0].message
+
+            if not msg.tool_calls:
+                break
+
+            messages.append(msg)
+
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                args = json.loads(tc.function.arguments or "{}")
+                tool_result = "ok"
+
+                if name == "not_a_desktop_action":
+                    return None
+
+                elif name == "task_complete":
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": "ok",
+                    })
+                    if actions_taken:
+                        return LocalVoiceResult(ok=True, message=", ".join(actions_taken), spoken="Done.")
+                    return LocalVoiceResult(ok=True, message="Done.", spoken="Done.")
+
+                elif name == "click":
+                    x, y = args["x"], args["y"]
+                    button = args.get("button", "left")
+                    clicks = args.get("clicks", 1)
+                    await asyncio.to_thread(_pag.click, x, y, button=button, clicks=clicks)
+                    actions_taken.append(f"clicked ({x},{y})")
+
+                elif name == "scroll":
+                    x, y = args["x"], args["y"]
+                    amount = args["amount"]
+                    await asyncio.to_thread(_pag.moveTo, x, y)
+                    await asyncio.to_thread(_pag.scroll, amount)
+                    actions_taken.append(f"scrolled {amount} at ({x},{y})")
+
+                elif name == "type_text":
+                    text = args["text"]
+                    await asyncio.to_thread(_pag.typewrite, text, interval=0.05)
+                    actions_taken.append(f"typed {len(text)} chars")
+
+                elif name == "press_key":
+                    key = args["key"]
+                    await asyncio.to_thread(_pag.press, key)
+                    actions_taken.append(f"pressed {key}")
+
+                elif name == "hotkey":
+                    keys = args["keys"]
+                    await asyncio.to_thread(_pag.hotkey, *keys)
+                    actions_taken.append(f"hotkey {'+'.join(keys)}")
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": tool_result,
+                })
+
+            # After all tool calls in this round, wait for UI to settle
+            # then send a fresh screenshot so next round sees updated state
+            await asyncio.sleep(0.8)
+            try:
+                new_png = await asyncio.to_thread(_get_screenshot_png)
+                if new_png:
+                    new_b64 = _base64.b64encode(new_png).decode()
+                    messages.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{new_b64}", "detail": "low"}},
+                            {"type": "text", "text": "Here is the current screen state. Continue if needed, or stop if the task is complete."},
+                        ],
+                    })
+            except Exception:
+                pass
+
+        if actions_taken:
+            summary = ", ".join(actions_taken)
+            return LocalVoiceResult(ok=True, message=summary, spoken="Done.")
+        return LocalVoiceResult(ok=True, message="No actions taken.", spoken="Done.")
+
+    except Exception as exc:
+        logger.warning("Desktop action LLM failed: %s", exc)
+        return None
+
+
+def _get_screenshot_png() -> bytes:
+    """Capture all monitors and return PNG bytes."""
+    try:
+        import mss
+        import mss.tools
+        with mss.mss() as sct:
+            shot = sct.grab(sct.monitors[0])
+            return mss.tools.to_png(shot.rgb, shot.size)
+    except Exception as exc:
+        logger.warning("Screenshot for desktop action failed: %s", exc)
+        return b""
 
 
 async def _handle_with_brain(transcript: str) -> LocalVoiceResult:
@@ -570,9 +1004,14 @@ async def _handle_with_brain(transcript: str) -> LocalVoiceResult:
     history = _history_context()
     identity_block = identity.get_identity_prompt()
     user_name = identity.get_user_name()
+
+    # World context — time, weather, markets
+    world_block = await _build_world_block()
+
     system = (
         f"{identity_block}\n\n"
-        "Rules for how you talk:\n"
+        + (f"{world_block}\n\n" if world_block else "")
+        + "Rules for how you talk:\n"
         f"- Address the user as '{user_name}' occasionally but not every response — keep it natural.\n"
         "- Speak naturally, like a real person. Use contractions. Don't be formal.\n"
         "- Never start a sentence with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
@@ -673,7 +1112,11 @@ async def run_capture_once(
     config: app_control.AppsConfig | None = None,
 ) -> LocalVoiceResult:
     """Record, transcribe, execute, and speak one local voice command."""
+    global _last_user_hwnd
     apps_config = config or app_control.load_apps_config()
+    from bot import mode as _mode
+    _mode.mark_user_active()
+    _last_user_hwnd = _capture_foreground_hwnd()
     print("Recording...")
     try:
         wav_bytes = await asyncio.to_thread(
@@ -811,6 +1254,9 @@ async def speak(text: str) -> None:
         play_wav_bytes(audio)
     except Exception as exc:
         logger.warning("Local TTS playback failed: %s", exc)
+    finally:
+        from bot import mode as _mode
+        _mode.mark_user_active()
 
 
 async def _confirm_in_terminal(command_preview: str) -> bool:
@@ -868,6 +1314,7 @@ async def _run_enter_loop(
     record_seconds: float,
     sample_rate: int,
     config: app_control.AppsConfig,
+    confirm: ConfirmCallback | None = None,
 ) -> None:
     """Run the original terminal Enter push-to-talk loop."""
     print(f"Press Enter to record {record_seconds:g}s. Press Ctrl+C to stop.")
@@ -876,7 +1323,7 @@ async def _run_enter_loop(
         await run_capture_once(
             record_seconds=record_seconds,
             sample_rate=sample_rate,
-            confirm=_confirm_in_terminal,
+            confirm=confirm or _confirm_in_terminal,
             config=config,
         )
 
@@ -887,13 +1334,14 @@ async def _run_hotkey_loop(
     record_seconds: float,
     sample_rate: int,
     config: app_control.AppsConfig,
+    confirm: ConfirmCallback | None = None,
 ) -> None:
     """Run the global hotkey push-to-talk loop."""
     try:
         import keyboard
     except ImportError:
         print("Global hotkey support needs the `keyboard` package. Falling back to Enter mode.")
-        await _run_enter_loop(record_seconds=record_seconds, sample_rate=sample_rate, config=config)
+        await _run_enter_loop(record_seconds=record_seconds, sample_rate=sample_rate, config=config, confirm=confirm)
         return
 
     loop = asyncio.get_running_loop()
@@ -907,7 +1355,7 @@ async def _run_hotkey_loop(
     except Exception as exc:
         print(f"Could not register global hotkey `{hotkey}`: {exc}")
         print("Falling back to Enter mode.")
-        await _run_enter_loop(record_seconds=record_seconds, sample_rate=sample_rate, config=config)
+        await _run_enter_loop(record_seconds=record_seconds, sample_rate=sample_rate, config=config, confirm=confirm)
         return
 
     print(f"Press {hotkey} to record. Press Ctrl+C to stop.")
@@ -921,7 +1369,7 @@ async def _run_hotkey_loop(
                 await run_capture_once(
                     record_seconds=record_seconds,
                     sample_rate=sample_rate,
-                    confirm=_confirm_in_terminal,
+                    confirm=confirm or _confirm_in_terminal,
                     config=config,
                 )
             finally:
@@ -940,6 +1388,7 @@ async def _run_wake_word_loop(
     record_seconds: float,
     sample_rate: int,
     config: app_control.AppsConfig,
+    confirm: ConfirmCallback | None = None,
 ) -> None:
     """Run the wake-word triggered voice loop."""
     loop = asyncio.get_running_loop()
@@ -962,7 +1411,7 @@ async def _run_wake_word_loop(
                 await run_capture_once(
                     record_seconds=record_seconds,
                     sample_rate=sample_rate,
-                    confirm=_confirm_in_terminal,
+                    confirm=confirm or _confirm_in_terminal,
                     config=config,
                 )
             finally:
@@ -977,6 +1426,60 @@ def _queue_hotkey_trigger(queue: asyncio.Queue[None]) -> None:
         queue.put_nowait(None)
     except asyncio.QueueFull:
         print("Hotkey pressed while Kira is already busy; ignoring.")
+
+
+async def start_as_task() -> None:
+    """Start the voice loop as a background task from main.py.
+
+    Skips env/logging/db setup (main.py already did those).
+    Reads trigger config from environment and runs the appropriate loop.
+    Risky command confirmations are routed to Telegram (no terminal available).
+    """
+    from bot import mode as mode_mod
+    from bot import notifier
+
+    record_seconds = float(os.environ.get("KIRA_LOCAL_VOICE_RECORD_SECONDS", _DEFAULT_RECORD_SECONDS))
+    sample_rate = int(os.environ.get("KIRA_LOCAL_VOICE_SAMPLE_RATE", _DEFAULT_SAMPLE_RATE))
+    trigger = os.environ.get("KIRA_LOCAL_VOICE_TRIGGER", _DEFAULT_TRIGGER).strip().lower()
+    hotkey = os.environ.get("KIRA_LOCAL_VOICE_HOTKEY", _DEFAULT_HOTKEY).strip() or _DEFAULT_HOTKEY
+    wake_word_name = os.environ.get("KIRA_WAKE_WORD", "hey_jarvis").strip()
+    wake_word_threshold = float(os.environ.get("KIRA_WAKE_WORD_THRESHOLD", "0.5"))
+    config = app_control.load_apps_config()
+
+    async def _smart_confirm(command_preview: str) -> bool:
+        if mode_mod.is_autonomous():
+            return await notifier.confirm_via_telegram(command_preview)
+        return await _confirm_in_terminal(command_preview)
+
+    confirm = _smart_confirm
+
+    overlay.start()
+    logger.info("Kira voice loop starting (trigger=%s)", trigger)
+
+    try:
+        if trigger == "enter":
+            await _run_enter_loop(record_seconds=record_seconds, sample_rate=sample_rate, config=config, confirm=confirm)
+        elif trigger == "wake_word":
+            await _run_wake_word_loop(
+                wake_word=wake_word_name,
+                threshold=wake_word_threshold,
+                record_seconds=record_seconds,
+                sample_rate=sample_rate,
+                config=config,
+                confirm=confirm,
+            )
+        else:
+            await _run_hotkey_loop(
+                hotkey=hotkey,
+                record_seconds=record_seconds,
+                sample_rate=sample_rate,
+                config=config,
+                confirm=confirm,
+            )
+    except asyncio.CancelledError:
+        logger.info("Kira voice loop cancelled")
+    except Exception:
+        logger.exception("Kira voice loop crashed")
 
 
 def main() -> None:

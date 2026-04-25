@@ -97,6 +97,12 @@ _PENDING_CONFIRMS: dict[str, dict] = {}
 _CONFIRM_TIMEOUT = 30  # seconds
 _PENDING_BRAIN_APPROVALS: dict[str, asyncio.Future[bool]] = {}
 _BRAIN_APPROVAL_TIMEOUT = 60
+_PENDING_VOICE_CONFIRMS: dict[str, asyncio.Future[bool]] = {}
+
+
+def register_voice_confirm(token: str, future: "asyncio.Future[bool]") -> None:
+    """Register a voice confirmation future so the callback handler can resolve it."""
+    _PENDING_VOICE_CONFIRMS[token] = future
 
 # Optional context file injected into the /ask system prompt.
 _PROJECT_CONTEXT_PATH = Path(os.environ.get("PROJECT_CONTEXT_PATH", str(Path(__file__).resolve().parent.parent / "context.md")))
@@ -1822,6 +1828,20 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         _PENDING_CONFIRMS.pop(token, None)
         await query.edit_message_text("❌ Cancelled.")
 
+    elif data.startswith("voice_confirm_"):
+        token = data[len("voice_confirm_"):]
+        future = _PENDING_VOICE_CONFIRMS.pop(token, None)
+        if future and not future.done():
+            future.set_result(True)
+        await query.edit_message_text("✅ Confirmed.")
+
+    elif data.startswith("voice_cancel_"):
+        token = data[len("voice_cancel_"):]
+        future = _PENDING_VOICE_CONFIRMS.pop(token, None)
+        if future and not future.done():
+            future.set_result(False)
+        await query.edit_message_text("❌ Cancelled.")
+
 
 # ── Application Management Commands ────────────────────────────────
 
@@ -2455,6 +2475,52 @@ async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     except Exception as exc:
         logger.error("handle_ask error: %s", exc, exc_info=True)
+        await update.message.reply_text(f"Error: {exc}")
+
+
+@require_auth
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Single entry point for all plain text messages. Routes to brain."""
+    await handle_message(update, context)
+
+
+
+@require_auth
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle plain text messages — routes through the same brain as /ask."""
+    user_message = (update.message.text or "").strip()
+    if not user_message:
+        return
+
+    try:
+        await db.log_conversation("user", user_message)
+    except Exception:
+        logger.debug("Failed to log message to DB", exc_info=True)
+
+    await update.message.reply_text("...")
+
+    try:
+        # Plain text messages go directly to the brain — no router.
+        # The router was built for /ask which handles PC commands. Free-text
+        # conversation is always a brain query; the brain decides if it needs tools.
+        task_request = brain.build_task_request(
+            user_input=user_message,
+            source="telegram",
+            route="complex",
+            conversation_id="telegram",
+        )
+        result = await _run_complex_task_with_progress(
+            update.message.reply_text,
+            task_request,
+        )
+        try:
+            await db.log_conversation("assistant", result.summary)
+        except Exception:
+            pass
+        await update.message.reply_text(result.summary[:4000])
+
+    except Exception as exc:
+        logger.error("handle_message error: %s", exc, exc_info=True)
         await update.message.reply_text(f"Error: {exc}")
 
 

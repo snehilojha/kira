@@ -48,14 +48,13 @@ ModeState = Literal[
     "recovering",
 ]
 
-# ── Configuration ─────────────────────────────────────────────────
+# ── Configuration (read at runtime so .env is loaded first) ───────
 
-_IDLE_THRESHOLD_SECONDS = float(
-    os.environ.get("KIRA_IDLE_THRESHOLD_SECONDS", "180")
-)
-_POLL_INTERVAL_SECONDS = float(
-    os.environ.get("KIRA_MODE_POLL_SECONDS", "30")
-)
+def _idle_threshold() -> float:
+    return float(os.environ.get("KIRA_IDLE_THRESHOLD_SECONDS", "180"))
+
+def _poll_interval() -> float:
+    return float(os.environ.get("KIRA_MODE_POLL_SECONDS", "30"))
 
 # ── Module state ──────────────────────────────────────────────────
 
@@ -64,6 +63,9 @@ _mode_entered_at: datetime = datetime.now(timezone.utc)
 
 # Timestamp when autonomous mode started — used for return summary scoping.
 _autonomous_since: datetime | None = None
+
+# Monotonic timestamp of last voice activity — prevents autonomous flip while talking.
+_last_voice_activity: float = 0.0
 
 
 # ── Public API ────────────────────────────────────────────────────
@@ -76,6 +78,13 @@ def get_mode() -> ModeState:
 def is_autonomous() -> bool:
     """Return True when Kira is in autonomous mode."""
     return _current_mode == "autonomous"
+
+
+def mark_user_active() -> None:
+    """Signal that the user is active via voice. Resets the voice idle clock."""
+    global _last_voice_activity
+    import time
+    _last_voice_activity = time.monotonic()
 
 
 def get_last_input_seconds() -> float:
@@ -130,19 +139,20 @@ async def start() -> None:
     Polls every KIRA_MODE_POLL_SECONDS. Transitions between active_session
     and autonomous based on last keyboard/mouse input time.
     """
+    idle_threshold = _idle_threshold()
+    poll_interval = _poll_interval()
     logger.info(
         "Mode monitor started (threshold=%.0fs, poll=%.0fs)",
-        _IDLE_THRESHOLD_SECONDS,
-        _POLL_INTERVAL_SECONDS,
+        idle_threshold, poll_interval,
     )
 
     # On startup, transition out of 'idle' based on current presence signal.
-    await _tick()
+    await _tick(idle_threshold)
 
     while True:
         try:
-            await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-            await _tick()
+            await asyncio.sleep(poll_interval)
+            await _tick(idle_threshold)
         except asyncio.CancelledError:
             logger.info("Mode monitor cancelled")
             raise
@@ -152,21 +162,27 @@ async def start() -> None:
 
 # ── Internal helpers ──────────────────────────────────────────────
 
-async def _tick() -> None:
+async def _tick(idle_threshold: float = 180.0) -> None:
     """Single presence check — called on startup and every poll interval."""
+    import time
     idle_seconds = _get_last_input_seconds()
 
-    if idle_seconds < _IDLE_THRESHOLD_SECONDS:
+    # Voice activity counts as presence — if wake word or transcript fired recently,
+    # treat user as active regardless of keyboard/mouse idle time.
+    voice_idle_seconds = time.monotonic() - _last_voice_activity
+    effective_idle = min(idle_seconds, voice_idle_seconds)
+
+    if effective_idle < idle_threshold:
         if _current_mode not in ("active_session", "awaiting_confirmation"):
             await set_mode(
                 "active_session",
-                f"input detected ({idle_seconds:.0f}s idle, threshold {_IDLE_THRESHOLD_SECONDS:.0f}s)",
+                f"input detected ({effective_idle:.0f}s idle, threshold {idle_threshold:.0f}s)",
             )
     else:
         if _current_mode not in ("autonomous", "awaiting_confirmation", "recovering"):
             await set_mode(
                 "autonomous",
-                f"no input for {idle_seconds:.0f}s (threshold {_IDLE_THRESHOLD_SECONDS:.0f}s)",
+                f"no input for {effective_idle:.0f}s (threshold {idle_threshold:.0f}s)",
             )
 
 
@@ -195,56 +211,48 @@ def _get_last_input_seconds() -> float:
 
 
 async def _send_return_summary(away_since: datetime | None) -> None:
-    """Build and send a summary of what happened during an autonomous period."""
+    """Build and send a natural-language summary of what happened while away."""
     try:
         from bot import db
         from bot import notifier
+        from bot import observer
+        from bot import provider
 
-        lines: list[str] = ["Welcome back, sir."]
-
+        now = datetime.now(timezone.utc)
+        elapsed_minutes = 0
         if away_since is not None:
-            elapsed = datetime.now(timezone.utc) - away_since
-            minutes = int(elapsed.total_seconds() // 60)
-            lines.append(f"Kira was in autonomous mode for {minutes} minute(s).")
+            elapsed_minutes = int((now - away_since).total_seconds() // 60)
 
-        # Monitor jobs that fired during the away window.
-        try:
-            all_jobs = await db.get_all_monitor_jobs()
-            fired = []
-            for job in all_jobs:
-                if job.get("last_fired_at") and away_since is not None:
-                    try:
-                        fired_dt = datetime.fromisoformat(job["last_fired_at"])
-                        if fired_dt.tzinfo is None:
-                            fired_dt = fired_dt.replace(tzinfo=timezone.utc)
-                        if fired_dt >= away_since:
-                            fired.append(job["name"])
-                    except ValueError:
-                        pass
-            if fired:
-                lines.append(f"Monitor jobs that triggered: {', '.join(fired)}.")
-            else:
-                lines.append("No monitor jobs triggered while you were away.")
-        except Exception as exc:
-            logger.debug("Return summary: failed to fetch monitor jobs: %s", exc)
+        # Collect raw facts
+        facts: list[str] = []
 
-        # Notifications sent during the away window (assistant messages logged to DB).
+        if elapsed_minutes > 0:
+            facts.append(f"User was away for {elapsed_minutes} minute(s).")
+
+        # Escalation pings that fired during absence
+        absence_events = observer.get_absence_log()
+        observer.clear_absence_log()
+        if absence_events:
+            for ev in absence_events:
+                facts.append(f"Escalation fired: {ev}")
+        else:
+            facts.append("No escalations fired while away.")
+
+        # Conversations sent during absence
         try:
             recent_convs = await db.get_recent_conversations(20)
             if away_since is not None:
-                away_messages = [
+                away_msgs = [
                     c for c in recent_convs
                     if c.get("role") == "assistant"
                     and _parse_ts(c.get("timestamp", "")) >= away_since
                 ]
-                if away_messages:
-                    lines.append(
-                        f"{len(away_messages)} message(s) sent while you were away."
-                    )
+                if away_msgs:
+                    facts.append(f"{len(away_msgs)} message(s) sent to user while away.")
         except Exception as exc:
             logger.debug("Return summary: failed to fetch conversations: %s", exc)
 
-        # Vision triggers during the away window.
+        # Vision triggers during absence
         try:
             triggers = await db.get_recent_vision_triggers(5)
             if away_since is not None:
@@ -254,14 +262,48 @@ async def _send_return_summary(away_since: datetime | None) -> None:
                 ]
                 if away_triggers:
                     types = [t["trigger_type"] for t in away_triggers]
-                    lines.append(
-                        f"Screen vision fired {len(away_triggers)} time(s): {', '.join(types)}."
-                    )
+                    facts.append(f"Screen vision fired {len(away_triggers)} time(s): {', '.join(types)}.")
         except Exception as exc:
             logger.debug("Return summary: failed to fetch vision triggers: %s", exc)
 
-        await notifier.send("\n".join(lines))
-        logger.info("Return summary sent")
+        raw_facts = "\n".join(facts)
+
+        # Ask GPT to write a natural welcome-back message
+        try:
+            response = await provider.create_chat_completion(
+                role="fast",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Kira, a personal AI assistant. The user has just returned to their computer. "
+                            "Write a short, natural welcome-back message (2-4 sentences) based on the facts below. "
+                            "Be direct and informative, not overly chatty. Address the user as 'sir'. "
+                            "If nothing notable happened, keep it brief."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Facts about what happened while the user was away:\n{raw_facts}",
+                    },
+                ],
+                max_tokens=120,
+                temperature=0.4,
+            )
+            summary = response.choices[0].message.content.strip()
+        except Exception as exc:
+            logger.warning("Return summary GPT call failed, using raw facts: %s", exc)
+            summary = "Welcome back, sir.\n" + raw_facts
+
+        await notifier.send(summary)
+        logger.info("Return summary sent (%d chars)", len(summary))
+
+        # Also speak it on the local system
+        try:
+            from bot import local_voice
+            await local_voice.speak(summary)
+        except Exception as exc:
+            logger.debug("Return summary TTS failed: %s", exc)
 
     except Exception as exc:
         logger.warning("Failed to send return summary: %s", exc)
