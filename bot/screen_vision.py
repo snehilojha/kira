@@ -197,6 +197,23 @@ async def capture_screen(question: str = "") -> str:
 
 # ── Internal helpers ──────────────────────────────────────────────
 
+def take_screenshot_png() -> bytes:
+    """Capture all monitors and return raw PNG bytes.
+
+    Returns empty bytes on failure.
+    """
+    try:
+        import mss
+        import mss.tools
+
+        with mss.mss() as sct:
+            shot = sct.grab(sct.monitors[0])
+            return mss.tools.to_png(shot.rgb, shot.size)
+    except Exception as exc:
+        logger.warning("Screenshot capture failed: %s", exc)
+        return b""
+
+
 def _take_screenshot() -> str:
     """Capture the primary monitor and return a base64-encoded PNG string.
 

@@ -303,17 +303,8 @@ def _collect_fast_snapshot() -> list[tuple[str, str]]:
 
 
 def _get_screenshot_bytes() -> bytes:
-    """Take a screenshot and return raw PNG bytes."""
-    try:
-        import mss
-        import mss.tools
-        with mss.mss() as sct:
-            monitor = sct.monitors[0]  # 0 = all monitors combined
-            shot = sct.grab(monitor)
-            return mss.tools.to_png(shot.rgb, shot.size)
-    except Exception as exc:
-        logger.warning("Screenshot failed: %s", exc)
-        return b""
+    from bot.screen_vision import take_screenshot_png
+    return take_screenshot_png()
 
 
 async def _run_cycle() -> None:

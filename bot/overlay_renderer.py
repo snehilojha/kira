@@ -6,7 +6,6 @@ runs smoothly at 60 fps without per-dot Python loops.
 Public API
 ----------
 set_state(state)  — 'idle'|'listening'|'thinking'|'speaking'|'autonomous'
-trigger_pulse()   — fire one expanding ring
 """
 
 from __future__ import annotations
@@ -102,9 +101,6 @@ class OrbRenderer(QWidget):
     def set_state(self, state: OrbState) -> None:
         self._target_energy = _STATE_ENERGY.get(state, 0.18)
         self._speaking = (state == "speaking")
-
-    def trigger_pulse(self) -> None:
-        pass  # pulses removed
 
     # ── Internal ──────────────────────────────────────────────────
 

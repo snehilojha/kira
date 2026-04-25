@@ -1048,16 +1048,8 @@ async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
 
 
 def _get_screenshot_png() -> bytes:
-    """Capture all monitors and return PNG bytes."""
-    try:
-        import mss
-        import mss.tools
-        with mss.mss() as sct:
-            shot = sct.grab(sct.monitors[0])
-            return mss.tools.to_png(shot.rgb, shot.size)
-    except Exception as exc:
-        logger.warning("Screenshot for desktop action failed: %s", exc)
-        return b""
+    from bot.screen_vision import take_screenshot_png
+    return take_screenshot_png()
 
 
 async def _handle_with_brain(transcript: str) -> LocalVoiceResult:
