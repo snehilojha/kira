@@ -51,7 +51,7 @@ try:
     )
     from PyQt6.QtWidgets import (
         QApplication, QFrame, QGraphicsOpacityEffect,
-        QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
+        QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
     )
     from bot.overlay_renderer import OrbRenderer
     _qt_available = True
@@ -171,11 +171,11 @@ class _LeftPanel(QWidget):
         self._clock_timer.start(1000)
         self._tick_clock()
 
-        # System stats refresh every 3 s
+        # System stats refresh every 3 s — fetch on background thread
         self._sys_timer = QTimer(self)
         self._sys_timer.timeout.connect(self._refresh_sys)
         self._sys_timer.start(3000)
-        self._refresh_sys()
+        threading.Thread(target=self._fetch_and_set_sys, daemon=True).start()
 
     def _tick_clock(self) -> None:
         import datetime
@@ -184,68 +184,81 @@ class _LeftPanel(QWidget):
         self._date_lbl.setText(now.strftime("%A, %d %B %Y").upper())
 
     def _refresh_sys(self) -> None:
+        """Called by QTimer on the Qt thread — just spawns the worker."""
+        threading.Thread(target=self._fetch_and_set_sys, daemon=True).start()
+
+    def _fetch_and_set_sys(self) -> None:
+        """All blocking I/O runs here on a background thread."""
         try:
-            import psutil
+            import psutil, subprocess as _sp
 
             cpu = psutil.cpu_percent()
             vm  = psutil.virtual_memory()
-            ram_used  = vm.used  / (1024 ** 3)
-            ram_total = vm.total / (1024 ** 3)
-            self._cpu.set_value(f"{cpu:.0f}%")
-            self._ram.set_value(f"{ram_used:.1f} / {ram_total:.0f} GB")
+            ram_str = f"{vm.used/(1024**3):.1f} / {vm.total/(1024**3):.0f} GB"
 
             try:
                 disk = psutil.disk_usage("C:\\")
-                self._disk.set_value(f"{disk.percent:.0f}%  {disk.used/(1024**3):.0f}/{disk.total/(1024**3):.0f} GB")
+                disk_str = f"{disk.percent:.0f}%  {disk.used/(1024**3):.0f}/{disk.total/(1024**3):.0f} GB"
             except Exception:
-                self._disk.set_value("N/A")
+                disk_str = "N/A"
 
-            # GPU via nvidia-smi (non-blocking)
             try:
-                import subprocess
-                out = subprocess.check_output(
+                out = _sp.check_output(
                     ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
                      "--format=csv,noheader,nounits"],
-                    timeout=1, stderr=subprocess.DEVNULL,
+                    timeout=1, stderr=_sp.DEVNULL,
                 ).decode().strip().split(",")
-                util  = out[0].strip()
-                mem_u = int(out[1].strip())
-                mem_t = int(out[2].strip())
-                self._gpu.set_value(f"{util}%  {mem_u}/{mem_t} MB")
+                gpu_str = f"{out[0].strip()}%  {int(out[1].strip())}/{int(out[2].strip())} MB"
             except Exception:
-                self._gpu.set_value("N/A")
+                gpu_str = "N/A"
 
             bat = psutil.sensors_battery()
-            if bat:
-                status = "charging" if bat.power_plugged else "·"
-                self._bat.set_value(f"{bat.percent:.0f}% {status}")
-            else:
-                self._bat.set_value("N/A")
+            bat_str = (f"{bat.percent:.0f}% {'charging' if bat.power_plugged else '·'}"
+                       if bat else "N/A")
 
-            # Top 4 CPU hogs — normalize by cpu_count so max is 100%
             cpu_cores = psutil.cpu_count(logical=True) or 1
             procs = sorted(
                 psutil.process_iter(["name", "cpu_percent"]),
                 key=lambda p: p.info.get("cpu_percent") or 0,
                 reverse=True,
             )
-            for i, lbl in enumerate(self._hog_labels):
-                if i < len(procs):
-                    name = (procs[i].info.get("name") or "?")[:18]
-                    raw  = procs[i].info.get("cpu_percent") or 0
-                    pct  = min(raw / cpu_cores, 100.0)
-                    lbl.setText(f"{name:<18} {pct:>5.1f}%")
-                else:
-                    lbl.setText("")
+            hog_lines = []
+            for p in procs[:4]:
+                name = (p.info.get("name") or "?")[:18]
+                pct  = min((p.info.get("cpu_percent") or 0) / cpu_cores, 100.0)
+                hog_lines.append(f"{name:<18} {pct:>5.1f}%")
 
+            elapsed = int(time.monotonic() - self._start)
+            up_str  = f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}"
+
+            # Post results back to Qt thread
+            if _window is not None:
+                QMetaObject.invokeMethod(
+                    _window, "_apply_sys_stats",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG("PyQt_PyObject", {
+                        "cpu": f"{cpu:.0f}%",
+                        "ram": ram_str,
+                        "disk": disk_str,
+                        "gpu": gpu_str,
+                        "bat": bat_str,
+                        "hogs": hog_lines,
+                        "up": up_str,
+                    }),
+                )
         except Exception:
             pass
 
-        elapsed = int(time.monotonic() - self._start)
-        h = elapsed // 3600
-        m = (elapsed % 3600) // 60
-        s = elapsed % 60
-        self._up.set_value(f"{h:02d}:{m:02d}:{s:02d}")
+    def apply_sys_stats(self, d: dict) -> None:
+        self._cpu.set_value(d.get("cpu", "—"))
+        self._ram.set_value(d.get("ram", "—"))
+        self._disk.set_value(d.get("disk", "—"))
+        self._gpu.set_value(d.get("gpu", "—"))
+        self._bat.set_value(d.get("bat", "—"))
+        self._up.set_value(d.get("up", "—"))
+        for i, lbl in enumerate(self._hog_labels):
+            hogs = d.get("hogs", [])
+            lbl.setText(hogs[i] if i < len(hogs) else "")
 
     def set_mode(self, mode: str) -> None:
         self._mode.set_value(mode.capitalize())
@@ -293,15 +306,32 @@ class _RightPanel(QWidget):
         wx_card.body().addWidget(self._wx)
         v.addWidget(wx_card)
 
+        # ── Markets card
+        mkt_card = _Card("Markets", self)
+        self._mkt_rows: list[_StatRow] = []
+        for name in ("NIFTY 50", "SENSEX", "BANK NIFTY", "BTC", "TAO"):
+            row = _StatRow(name)
+            mkt_card.body().addWidget(row)
+            self._mkt_rows.append(row)
+        v.addWidget(mkt_card)
+
         # ── You card
         you_card = _Card("You", self)
         self._you = QLabel("—")
         self._you.setWordWrap(True)
         self._you.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self._you.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        self._you.setMinimumHeight(36)
         self._you.setStyleSheet("color:rgba(220,210,245,210);font-size:12px;")
-        you_card.body().addWidget(self._you)
+        you_scroll = QScrollArea()
+        you_scroll.setWidget(self._you)
+        you_scroll.setWidgetResizable(True)
+        you_scroll.setFixedHeight(60)
+        you_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        you_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        you_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}"
+                                 "QScrollBar:vertical{width:3px;background:transparent;}"
+                                 "QScrollBar::handle:vertical{background:rgba(140,100,255,80);border-radius:1px;}"
+                                 "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0px;}")
+        you_card.body().addWidget(you_scroll)
         v.addWidget(you_card)
 
         # ── Kira card — expands to fill remaining space
@@ -310,12 +340,21 @@ class _RightPanel(QWidget):
         self._kira = QLabel("Ready.")
         self._kira.setWordWrap(True)
         self._kira.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self._kira.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
-        self._kira.setMinimumHeight(120)
         self._kira.setStyleSheet("color:rgba(180,150,240,200);font-size:12px;line-height:1.5;")
+        kira_scroll = QScrollArea()
+        kira_scroll.setWidget(self._kira)
+        kira_scroll.setWidgetResizable(True)
+        kira_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        kira_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        kira_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        kira_scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}"
+                                  "QScrollBar:vertical{width:3px;background:transparent;}"
+                                  "QScrollBar::handle:vertical{background:rgba(140,100,255,80);border-radius:1px;}"
+                                  "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0px;}")
+        self._kira_scroll = kira_scroll
         self._action = QLabel("")
         self._action.setStyleSheet("color:rgba(160,100,255,70);font-size:7px;letter-spacing:3px;")
-        kira_card.body().addWidget(self._kira, stretch=1)
+        kira_card.body().addWidget(kira_scroll, stretch=1)
         kira_card.body().addWidget(self._action)
         v.addWidget(kira_card, stretch=1)
 
@@ -324,6 +363,40 @@ class _RightPanel(QWidget):
         self._wx_timer = QTimer(self)
         self._wx_timer.timeout.connect(self._refresh_weather)
         self._wx_timer.start(10 * 60 * 1000)
+
+    def set_market_data(self, snapshot) -> None:
+        """Update markets strip from a MarketSnapshot object."""
+        _GRN = "rgba(100,220,140,220)"
+        _RED = "rgba(255,100,100,220)"
+        _NEU = "rgba(200,170,255,180)"
+
+        def _fmt_inr(v: float) -> str:
+            if v >= 1_00_00_000:   # ≥ 1 Cr
+                return f"₹{v/1_00_00_000:.2f}Cr"
+            if v >= 1_00_000:      # ≥ 1 L
+                return f"₹{v/1_00_000:.2f}L"
+            if v >= 1_000:
+                return f"₹{v:,.0f}"
+            return f"₹{v:.2f}"
+
+        n_indices = len(snapshot.indices)
+        all_tickers = snapshot.indices + snapshot.crypto
+        for i, row in enumerate(self._mkt_rows):
+            if i < len(all_tickers):
+                t = all_tickers[i]
+                chg = t.change_pct
+                sign = "+" if chg >= 0 else ""
+                color = _GRN if chg >= 0 else _RED
+                is_crypto = i >= n_indices
+                if is_crypto:
+                    price_str = f"${t.price:,.0f}" if t.price >= 1000 else f"${t.price:,.2f}"
+                else:
+                    price_str = _fmt_inr(t.price)
+                row._value.setText(f"{price_str}  {sign}{chg:.2f}%")
+                row._value.setStyleSheet(f"color:{color};font-size:9px;font-weight:600;")
+            else:
+                row._value.setText("—")
+                row._value.setStyleSheet(f"color:{_NEU};font-size:9px;font-weight:600;")
 
     def _refresh_weather(self) -> None:
         threading.Thread(target=self._fetch_and_set_weather, daemon=True).start()
@@ -343,6 +416,9 @@ class _RightPanel(QWidget):
     def set_transcript(self, you: str, kira: str) -> None:
         self._you.setText(you or "—")
         self._kira.setText(kira or "")
+        # Scroll Kira's box to the bottom so latest text is always visible
+        sb = self._kira_scroll.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def set_state(self, state: OrbState) -> None:
         actions = {
@@ -494,6 +570,12 @@ class _KiraOverlay(QWidget):
         # Global hotkey registered via keyboard package (works even when Qt has no focus)
         _register_global_hotkey(self)
 
+        # Market data — fetch immediately then every 5 min
+        self._market_timer = QTimer(self)
+        self._market_timer.timeout.connect(self._refresh_market_data)
+        self._market_timer.start(5 * 60 * 1000)
+        self._refresh_market_data()
+
         self._apply_compact_geometry()
         self.hide()
 
@@ -585,6 +667,10 @@ class _KiraOverlay(QWidget):
             self._visible = False
             self._fade_to(0.0, on_done=self.hide)
 
+    @pyqtSlot(float)
+    def _set_amplitude(self, v: float) -> None:
+        self._orb_full.set_amplitude(v)
+
     @pyqtSlot(str)
     def _set_state(self, state: str) -> None:
         labels = {
@@ -605,6 +691,30 @@ class _KiraOverlay(QWidget):
     @pyqtSlot(str)
     def _set_weather_text(self, text: str) -> None:
         self._right.set_weather(text)
+
+    def _refresh_market_data(self) -> None:
+        threading.Thread(target=self._fetch_and_set_market, daemon=True).start()
+
+    def _fetch_and_set_market(self) -> None:
+        try:
+            from bot.market_data import fetch_snapshot
+            snap = fetch_snapshot()
+            if _window is not None:
+                QMetaObject.invokeMethod(
+                    _window, "_set_market_data",
+                    Qt.ConnectionType.QueuedConnection,
+                    Q_ARG("PyQt_PyObject", snap),
+                )
+        except Exception as exc:
+            logger.debug("Market fetch failed: %s", exc)
+
+    @pyqtSlot("PyQt_PyObject")
+    def _set_market_data(self, snap) -> None:
+        self._right.set_market_data(snap)
+
+    @pyqtSlot("PyQt_PyObject")
+    def _apply_sys_stats(self, d: dict) -> None:
+        self._left.apply_sys_stats(d)
 
     @pyqtSlot()
     def _launch_webcam_preview(self) -> None:
@@ -752,6 +862,11 @@ def set_transcript(you: str = "", kira: str = "") -> None:
 def set_full_mode(on: bool) -> None:
     """Switch between compact and full mode."""
     _invoke("_set_full_mode", on)
+
+
+def push_amplitude(v: float) -> None:
+    """Push live audio amplitude [0,1] to the orb during TTS playback."""
+    _invoke("_set_amplitude", v)
 
 
 def stop() -> None:

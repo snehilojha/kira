@@ -2,6 +2,10 @@
 
 Centralises client creation, model role lookup, and provider configuration
 so handlers and background tasks do not construct API clients directly.
+
+TTS uses its own provider settings (KIRA_TTS_API_KEY / KIRA_TTS_BASE_URL)
+so you can route TTS to a different provider (e.g. OpenRouter) while keeping
+chat/vision on OpenAI — or use the same provider for everything.
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ _DEFAULT_FAST_MODEL = "gpt-4o-mini"
 _DEFAULT_SMART_MODEL = "gpt-4o-mini"
 _DEFAULT_VISION_MODEL = "gpt-4o-mini"
 _DEFAULT_VOICE_TRANSCRIBE_MODEL = "whisper-1"
-_DEFAULT_VOICE_SYNTHESISE_MODEL = "tts-1"
+_DEFAULT_VOICE_SYNTHESISE_MODEL = "tts-1-hd"
 
 
 @dataclass(frozen=True)
@@ -30,13 +34,18 @@ class ProviderConfig:
     voice_synthesise_model: str
 
 
-def load_config() -> ProviderConfig:
-    """Resolve provider settings from environment variables.
+@dataclass(frozen=True)
+class TTSConfig:
+    """Separate provider config just for TTS — can point to a different provider."""
 
-    `OPENAI_API_KEY` remains the default for backward compatibility.
-    `KIRA_*` settings allow the bot to move to a single provider abstraction
-    without changing call sites again later.
-    """
+    api_key: str
+    base_url: str | None
+    model: str
+    voice: str
+
+
+def load_config() -> ProviderConfig:
+    """Resolve provider settings from environment variables."""
     api_key = (
         os.environ.get("KIRA_API_KEY")
         or os.environ.get("OPENROUTER_API_KEY")
@@ -69,6 +78,28 @@ def load_config() -> ProviderConfig:
     )
 
 
+def load_tts_config() -> TTSConfig:
+    """Resolve TTS-specific provider settings.
+
+    Falls back to the main provider config if no TTS-specific settings are set.
+    This lets you route TTS to OpenRouter (or any other provider) independently.
+
+    .env keys:
+        KIRA_TTS_API_KEY     — TTS provider API key (falls back to main key)
+        KIRA_TTS_BASE_URL    — TTS provider base URL (e.g. https://openrouter.ai/api/v1)
+        KIRA_TTS_MODEL       — TTS model ID as the provider knows it
+        KIRA_VOICE           — voice name (default: nova)
+    """
+    main = load_config()
+
+    api_key = os.environ.get("KIRA_TTS_API_KEY") or main.api_key
+    base_url = os.environ.get("KIRA_TTS_BASE_URL") or main.base_url
+    model = os.environ.get("KIRA_TTS_MODEL") or main.voice_synthesise_model
+    voice = os.environ.get("KIRA_VOICE", "nova")
+
+    return TTSConfig(api_key=api_key, base_url=base_url, model=model, voice=voice)
+
+
 def get_model(role: str) -> str:
     """Return the configured model name for a known role."""
     config = load_config()
@@ -96,6 +127,20 @@ def create_client() -> Any:
     kwargs: dict[str, Any] = {"api_key": config.api_key}
     if config.base_url:
         kwargs["base_url"] = config.base_url
+    return AsyncOpenAI(**kwargs)
+
+
+def create_tts_client() -> Any:
+    """Create an async OpenAI-compatible client for TTS (may be a different provider)."""
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as exc:
+        raise ImportError("openai package not installed. Run: pip install openai") from exc
+
+    tts = load_tts_config()
+    kwargs: dict[str, Any] = {"api_key": tts.api_key}
+    if tts.base_url:
+        kwargs["base_url"] = tts.base_url
     return AsyncOpenAI(**kwargs)
 
 
@@ -130,10 +175,11 @@ async def transcribe_audio(*, file: Any, language: str = "en", **kwargs: Any) ->
 
 
 async def synthesise_speech(*, text: str, voice: str, response_format: str = "mp3", **kwargs: Any) -> Any:
-    """Run text-to-speech using the configured speech model."""
-    client = create_client()
+    """Run text-to-speech using the TTS provider (may differ from chat provider)."""
+    tts = load_tts_config()
+    client = create_tts_client()
     return await client.audio.speech.create(
-        model=get_model("voice_synthesise"),
+        model=tts.model,
         voice=voice,
         input=text,
         response_format=response_format,
@@ -148,17 +194,7 @@ async def create_vision_completion(
     max_tokens: int = 300,
     image_format: str = "png",
 ) -> Any:
-    """Send an image to the vision model and return the completion response.
-
-    Args:
-        prompt: Text instruction for the vision model.
-        image_b64: Base64-encoded image bytes (no data-URI prefix needed).
-        max_tokens: Maximum tokens for the response.
-        image_format: MIME sub-type — "png" or "jpeg". Defaults to "png".
-
-    Returns:
-        The raw OpenAI-compatible completion response object.
-    """
+    """Send an image to the vision model and return the completion response."""
     client = create_client()
     mime = f"image/{image_format}"
     messages = [

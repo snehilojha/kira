@@ -24,7 +24,7 @@ _STATE_ENERGY: dict[OrbState, float] = {
     "idle":       0.32,
     "listening":  0.80,
     "thinking":   0.60,
-    "speaking":   0.98,
+    "speaking":   0.72,   # base — amplitude pushes it higher in real time
     "autonomous": 0.20,
 }
 
@@ -79,6 +79,7 @@ class OrbRenderer(QWidget):
         self._energy        = 0.32
         self._target_energy = 0.32
         self._speaking      = False
+        self._amplitude     = 0.0   # live audio amplitude [0,1], decays each tick
         self._t             = 0
         self._rot_y         = 0.0
         self._rot_x         = 0.35
@@ -101,13 +102,26 @@ class OrbRenderer(QWidget):
     def set_state(self, state: OrbState) -> None:
         self._target_energy = _STATE_ENERGY.get(state, 0.18)
         self._speaking = (state == "speaking")
+        if not self._speaking:
+            self._amplitude = 0.0
+
+    def set_amplitude(self, v: float) -> None:
+        """Push a live audio amplitude value [0,1]. Called ~20x/sec during TTS."""
+        self._amplitude = max(0.0, min(1.0, v))
 
     # ── Internal ──────────────────────────────────────────────────
 
     def _tick(self) -> None:
-        self._energy += (self._target_energy - self._energy) * 0.06
+        # During speaking: energy rides on base + live amplitude boost
+        if self._speaking:
+            target = self._target_energy + self._amplitude * 0.28
+        else:
+            target = self._target_energy
+        self._energy += (target - self._energy) * 0.10   # faster response during speech
+        # Amplitude decays naturally — orb relaxes between words
+        self._amplitude *= 0.82
         self._t += 1
-        self._rot_y += 0.004 + self._energy * 0.005
+        self._rot_y += 0.004 + self._energy * 0.008   # spins faster at high energy
         self.update()
 
     def paintEvent(self, event):
@@ -140,7 +154,8 @@ class OrbRenderer(QWidget):
         noise_pts[:, 0] += self._seeds
         noise_pts[:, 2] += nt
         n = _value_noise_batch(noise_pts)
-        speak_churn = 0.18 * abs(math.sin(t * 0.12)) if self._speaking else 0.0
+        # Churn driven by live amplitude — surface erupts when Kira is loud
+        speak_churn = (0.10 + self._amplitude * 0.22) if self._speaking else 0.0
         disp = (n * 2 - 1) * turb_amp + speak_churn * (n - 0.5)
         radius = BASE_R * (1.0 + disp)
 

@@ -1412,6 +1412,20 @@ async def handle_summarise(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 @require_auth
+async def handle_reflect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """``/reflect`` — run weekly behavioral reflection immediately."""
+    from bot import reflector
+    await update.message.reply_text("Running behavioral reflection over the past 7 days...")
+    try:
+        facts = await reflector.reflect_now()
+        facts_text = "\n".join(f"• {f}" for f in facts)
+        await update.message.reply_text(f"Reflection complete. Updated facts:\n\n{facts_text}")
+    except Exception as exc:
+        logger.error("handle_reflect failed: %s", exc)
+        await update.message.reply_text(f"Reflection failed: {exc}")
+
+
+@require_auth
 async def handle_recall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """``/recall <query>`` — ask a natural-language question over recent session history."""
     from bot import memory, db

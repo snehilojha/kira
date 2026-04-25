@@ -32,6 +32,7 @@ from bot import scheduler
 from bot import task_state
 from bot import watchdog
 from bot import world
+from bot import reflector
 from bot.auth import load_allowed_users
 
 # ── Paths ─────────────────────────────────────────────────────────
@@ -128,6 +129,7 @@ def _build_ptb_app(token: str):
         application.create_task(mode.start())
         application.create_task(world.start())
         application.create_task(local_voice.start_as_task())
+        application.create_task(reflector.start_weekly_reflector())
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
 
@@ -170,6 +172,7 @@ def _build_ptb_app(token: str):
         "history": handlers.handle_history,
         "runs": handlers.handle_runs,
         "summarise": handlers.handle_summarise,
+        "reflect": handlers.handle_reflect,
         "recall": handlers.handle_recall,
         "jobs": handlers.handle_jobs,
         "canceljob": handlers.handle_cancel_job,

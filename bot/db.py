@@ -193,6 +193,14 @@ CREATE TABLE IF NOT EXISTS vision_triggers (
     notified        INTEGER NOT NULL DEFAULT 0,
     occurred_at     TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS voice_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL DEFAULT (datetime('now')),
+    transcript  TEXT    NOT NULL,
+    result      TEXT    NOT NULL,
+    intent      TEXT    NOT NULL DEFAULT 'brain'
+);
 """
 
 
@@ -748,6 +756,31 @@ async def get_recent_vision_triggers(limit: int = 10) -> list[dict[str, Any]]:
         "SELECT id, trigger_type, process_label, interpretation, notified, occurred_at "
         "FROM vision_triggers ORDER BY id DESC LIMIT ?",
         (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Voice log helpers ─────────────────────────────────────────────
+
+async def log_voice_command(transcript: str, result: str, intent: str = "brain") -> None:
+    """Persist one voice exchange to the behavioral log."""
+    conn = _get_conn()
+    await conn.execute(
+        "INSERT INTO voice_log (transcript, result, intent) VALUES (?, ?, ?)",
+        (transcript[:1000], result[:500], intent),
+    )
+    await conn.commit()
+
+
+async def get_voice_log(days: int = 7) -> list[dict[str, Any]]:
+    """Return voice commands from the last *days* days, oldest first."""
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT timestamp, transcript, result, intent FROM voice_log "
+        "WHERE timestamp >= datetime('now', ? || ' days') "
+        "ORDER BY id ASC",
+        (f"-{days}",),
     )
     rows = await cursor.fetchall()
     return [dict(r) for r in rows]

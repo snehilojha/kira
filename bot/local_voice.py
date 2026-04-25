@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import threading
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -583,6 +584,14 @@ def _build_identity_reply(transcript: str) -> str:
     return f"Here's what I know about {name_part}: {facts_spoken}."
 
 
+async def _log(transcript: str, result: str, intent: str) -> None:
+    """Fire-and-forget voice command persistence."""
+    try:
+        await db.log_voice_command(transcript, result, intent)
+    except Exception:
+        pass
+
+
 async def handle_transcript(
     transcript: str,
     *,
@@ -594,26 +603,31 @@ async def handle_transcript(
     memory_reply = identity.extract_memory_from_transcript(transcript)
     if memory_reply:
         _command_history.append((transcript, memory_reply[:80]))
+        await _log(transcript, memory_reply, "memory")
         return None, LocalVoiceResult(ok=True, message=memory_reply, spoken=memory_reply)
 
     if _is_identity_query(transcript):
         spoken = _build_identity_reply(transcript)
         _command_history.append((transcript, spoken[:80]))
+        await _log(transcript, spoken, "identity")
         return None, LocalVoiceResult(ok=True, message=spoken, spoken=spoken)
 
     if _is_screen_query(transcript):
         description = await screen_vision.capture_screen()
         _command_history.append((transcript, description[:80]))
+        await _log(transcript, description, "screen")
         return None, LocalVoiceResult(ok=True, message=description, spoken=description)
 
     webcam_result = await _handle_webcam_intent(transcript)
     if webcam_result is not None:
         _command_history.append((transcript, webcam_result.message[:80]))
+        await _log(transcript, webcam_result.message, "webcam")
         return None, webcam_result
 
     if _is_multistep(transcript):
         result = await _handle_multistep(transcript)
         _command_history.append((transcript, result.message[:80]))
+        await _log(transcript, result.message, "multistep")
         return None, result
 
     apps_config = config or app_control.load_apps_config()
@@ -621,6 +635,7 @@ async def handle_transcript(
     if parsed is not None:
         result = await execute_command(parsed, confirm=confirm, config=apps_config)
         _command_history.append((transcript, result.message[:80]))
+        await _log(transcript, result.message, "desktop")
         return parsed, result
 
     # For everything else: vision-based desktop action first (LLM sees screen,
@@ -628,11 +643,13 @@ async def handle_transcript(
     desktop_result = await _handle_desktop_action(transcript)
     if desktop_result is not None:
         _command_history.append((transcript, desktop_result.message[:80]))
+        await _log(transcript, desktop_result.message, "desktop")
         return None, desktop_result
 
     result = await _handle_with_brain(transcript)
     _command_history.append((transcript, result.message[:80]))
     _append_session_history(transcript, result.spoken)
+    await _log(transcript, result.spoken, "brain")
     return None, result
 
 
@@ -1141,20 +1158,38 @@ async def _handle_with_brain(transcript: str) -> LocalVoiceResult:
     # World context — time, weather, markets
     world_block = await _build_world_block()
 
+    # Ambient screen context (Feature 5)
+    ambient_block = ""
+    try:
+        from bot import ambient as _ambient
+        ambient_block = _ambient.get_description()
+    except Exception:
+        pass
+
     system = (
         f"{identity_block}\n\n"
         + (f"{world_block}\n\n" if world_block else "")
-        + "Rules for how you talk:\n"
-        f"- Address the user as '{user_name}' occasionally but not every response — keep it natural.\n"
-        "- Speak naturally, like a real person. Use contractions. Don't be formal.\n"
-        "- Never start a sentence with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
-        "- Match response length to the question. Simple = one or two sentences. Complex = short paragraph max.\n"
-        "- No markdown. No bullet points. No headers. Your response is read aloud via TTS.\n"
-        "- Be direct and confident. Don't hedge with 'I think' or 'it seems like' unless genuinely uncertain.\n"
-        "- If you don't know something or it requires current data, use web_search — don't say you can't look it up.\n"
-        "- Never mention that you're an AI or that you have limitations unless directly asked.\n"
-        "- If screen context is provided, use it to give more relevant answers.\n"
-        "Always use web_search for current events, news, weather, prices, sports scores, or anything time-sensitive."
+        + (f"User's current activity: {ambient_block}\n\n" if ambient_block else "")
+        + "You are Kira — sharp, warm, and direct. You talk like a brilliant friend, not a customer-support bot.\n\n"
+        "How to respond:\n"
+        f"- Use '{user_name}' occasionally — not every reply, only when it feels natural.\n"
+        "- Speak in contractions. Be conversational. Never be stiff or formal.\n"
+        "- Never open with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
+        "- Length: match the question. One sentence for simple things. Two short sentences max for complex ones.\n"
+        "- Zero markdown. Zero bullet points. Zero headers. Your words go straight to TTS.\n"
+        "- Have opinions. Be confident. Skip the hedges — 'I think' and 'it seems' water you down.\n"
+        "- Don't recite raw data. Synthesise it into one useful takeaway.\n"
+        "- Never say you can't search — use web_search instead.\n"
+        "- Never acknowledge being an AI unless directly asked.\n"
+        "Always use web_search for current events, news, weather, prices, sports scores, or anything time-sensitive.\n\n"
+        "Emotion tags — use sparingly and only when they feel genuinely natural:\n"
+        "- <laugh> for something actually funny\n"
+        "- <sigh> when something is tedious, unfortunate, or you're being wry\n"
+        "- <chuckle> for mild amusement\n"
+        "- <gasp> for genuine surprise\n"
+        "- <yawn> only if asked about something boring\n"
+        "Example: 'Yeah that's a known bug. <sigh> Been around for years.'\n"
+        "Do NOT force them. Most replies need zero tags."
         + (f"\n\n{history}" if history else "")
     )
 
@@ -1383,31 +1418,86 @@ def record_wav_bytes(
 
 
 def play_wav_bytes(audio_bytes: bytes) -> None:
-    """Play WAV bytes through the default output device."""
+    """Play WAV bytes through the default output device.
+
+    Uses a sounddevice callback stream so audio runs on its own OS audio
+    thread — the calling thread never blocks on audio I/O.  A lightweight
+    daemon thread pushes RMS amplitude to the orb every 50 ms in parallel.
+    """
     import numpy as np
     import sounddevice as sd
 
     with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
         sample_rate = wav_file.getframerate()
-        channels = wav_file.getnchannels()
+        channels    = wav_file.getnchannels()
         sample_width = wav_file.getsampwidth()
-        frames = wav_file.readframes(wav_file.getnframes())
+        frames      = wav_file.readframes(wav_file.getnframes())
 
     if sample_width != 2:
         raise ValueError(f"Unsupported WAV sample width: {sample_width}")
 
-    audio = np.frombuffer(frames, dtype=np.int16)
-    if channels > 1:
-        audio = audio.reshape(-1, channels)
-    sd.play(audio, sample_rate)
-    sd.wait()
+    raw = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    audio_f32 = raw.reshape(-1, channels)   # shape: (samples, channels)
+    mono      = raw.reshape(-1, channels).mean(axis=1)
+
+    _MAX_RMS      = 0.18        # normalised float RMS for typical speech
+    _AMP_INTERVAL = 0.05        # seconds between amplitude pushes (50 ms)
+    _amp_chunk    = int(sample_rate * _AMP_INTERVAL)
+
+    # Pre-compute per-chunk RMS so the amplitude thread is trivial
+    n_chunks = max(1, len(mono) // _amp_chunk)
+    amp_timeline = []
+    for i in range(n_chunks):
+        sl = mono[i * _amp_chunk : (i + 1) * _amp_chunk]
+        rms = float(np.sqrt(np.mean(sl ** 2))) if len(sl) else 0.0
+        amp_timeline.append(min(rms / _MAX_RMS, 1.0))
+
+    # Cursor shared between callback and the main thread (list = mutable reference)
+    cursor = [0]
+    done_event = threading.Event()
+
+    def _callback(outdata, frames, time_info, status):
+        start = cursor[0]
+        end   = start + frames
+        chunk = audio_f32[start:end]
+        if len(chunk) < frames:
+            # Pad the last block with silence and signal done
+            outdata[:len(chunk)] = chunk
+            outdata[len(chunk):] = 0
+            cursor[0] = len(audio_f32)
+            done_event.set()
+            raise sd.CallbackStop()
+        outdata[:] = chunk
+        cursor[0]  = end
+
+    # Amplitude pusher — runs on a daemon thread, never touches the audio stream
+    def _push_amplitudes():
+        for amp in amp_timeline:
+            overlay.push_amplitude(amp)
+            threading.Event().wait(_AMP_INTERVAL)   # non-blocking sleep
+        overlay.push_amplitude(0.0)
+
+    amp_thread = threading.Thread(target=_push_amplitudes, daemon=True)
+
+    with sd.OutputStream(
+        samplerate=sample_rate,
+        channels=channels,
+        dtype="float32",
+        callback=_callback,
+        finished_callback=done_event.set,
+    ):
+        amp_thread.start()
+        done_event.wait()   # block calling thread until audio finishes (not Qt thread)
 
 
 async def speak(text: str) -> None:
     """Speak a short local response, falling back to console only on failure."""
     try:
-        audio = await voice.synthesise(text, response_format="wav")
-        play_wav_bytes(audio)
+        audio_bytes, fmt = await voice.synthesise(text)
+        if fmt != "wav":
+            audio_bytes = await asyncio.to_thread(voice.mp3_to_wav_bytes, audio_bytes)
+        # Run blocking playback on a thread pool so the asyncio loop stays free
+        await asyncio.to_thread(play_wav_bytes, audio_bytes)
     except Exception as exc:
         logger.warning("Local TTS playback failed: %s", exc)
     finally:
@@ -1442,6 +1532,12 @@ async def run_loop() -> None:
     overlay.start()
     print("Kira local voice is ready.")
     logger.info("Kira local voice is ready")
+
+    # Feature 4 + 5: start proactive and ambient loops
+    from bot import proactive as _proactive
+    from bot import ambient as _ambient
+    _ambient.start()
+    _proactive.start(speak)
 
     if trigger == "enter":
         await _run_enter_loop(record_seconds=record_seconds, sample_rate=sample_rate, config=config)
@@ -1610,6 +1706,12 @@ async def start_as_task() -> None:
     confirm = _smart_confirm
 
     logger.info("Kira voice loop starting (trigger=%s)", trigger)
+
+    # Feature 4 + 5: start proactive and ambient loops
+    from bot import proactive as _proactive
+    from bot import ambient as _ambient
+    _ambient.start()
+    _proactive.start(speak)
 
     try:
         if trigger == "enter":
