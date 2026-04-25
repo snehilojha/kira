@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Any
 
 import psutil
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python < 3.11 fallback
+    tomllib = None
 import toml
 
 logger = logging.getLogger(__name__)
@@ -78,7 +82,11 @@ def load_apps_config(path: Path | None = None) -> AppsConfig:
     if not config_path.exists():
         return AppsConfig()
 
-    loaded = toml.load(config_path)
+    if tomllib is not None:
+        with open(config_path, "rb") as fh:
+            loaded = tomllib.load(fh)
+    else:
+        loaded = toml.load(config_path)
     raw_apps = loaded.get("apps", {})
     raw_modes = loaded.get("modes", {})
     raw_intents = loaded.get("intents", {})

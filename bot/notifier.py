@@ -39,12 +39,12 @@ async def confirm_via_telegram(command_preview: str) -> bool:
 
     Returns True if confirmed, False if cancelled or timed out.
     """
-    from bot import handlers
+    from bot import voice_confirm
 
     token = f"vc_{int(time.monotonic() * 1000)}"
     loop = asyncio.get_running_loop()
     future: asyncio.Future[bool] = loop.create_future()
-    handlers.register_voice_confirm(token, future)
+    voice_confirm.register_voice_confirm(token, future)
 
     keyboard = [
         [
@@ -73,7 +73,7 @@ async def confirm_via_telegram(command_preview: str) -> bool:
     try:
         return await asyncio.wait_for(future, timeout=_VOICE_CONFIRM_TIMEOUT)
     except asyncio.TimeoutError:
-        handlers._PENDING_VOICE_CONFIRMS.pop(token, None)
+        voice_confirm._PENDING_VOICE_CONFIRMS.pop(token, None)
         await send("⏰ Voice confirmation timed out — command cancelled.")
         return False
 
