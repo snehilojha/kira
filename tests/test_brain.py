@@ -92,7 +92,7 @@ class BrainAsyncTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Recent session history", context.memory_context[0])
         self.assertIn("Project context", context.memory_context[1])
-        self.assertEqual(context.available_tools, ["file_read", "grep", "glob"])
+        self.assertEqual(context.available_tools, ["file_read", "grep", "glob", "web_search"])
         self.assertIn("bash", context.capability_policy["require_confirmation"])
         self.assertIn("file_delete", context.capability_policy["deny_or_manual_only"])
         self.assertEqual(context.state_snapshot["running_processes"][0]["pid"], 11)

@@ -28,6 +28,7 @@ from telegram.ext import ContextTypes
 
 from bot.auth import require_auth
 from bot import app_control
+from bot import utils as _bot_utils
 from bot import approval
 from bot import brain
 from bot import db
@@ -49,6 +50,9 @@ logger = logging.getLogger(__name__)
 
 _SCRIPTS_CONFIG: dict = {}
 _DEFAULT_TIMEOUT: int = 30
+
+# Exposed so tests can monkey-patch the path without touching bot.utils internals.
+_PROJECT_CONTEXT_PATH = _bot_utils._PROJECT_CONTEXT_PATH
 
 
 def load_config() -> None:
@@ -104,9 +108,6 @@ def register_voice_confirm(token: str, future: "asyncio.Future[bool]") -> None:
     """Register a voice confirmation future so the callback handler can resolve it."""
     _PENDING_VOICE_CONFIRMS[token] = future
 
-# Optional context file injected into the /ask system prompt.
-_PROJECT_CONTEXT_PATH = Path(os.environ.get("PROJECT_CONTEXT_PATH", str(Path(__file__).resolve().parent.parent / "context.md")))
-_PROJECT_CONTEXT_MAX_CHARS = 12000
 _RECENT_OUTPUT_MAX_CHARS = 2000
 _RECENT_OUTPUT_LINES: deque[str] = deque(maxlen=20)
 
@@ -151,19 +152,7 @@ def _get_recent_output_tail() -> str:
 
 
 def _load_project_context() -> str:
-    """Return the project context file content, capped for prompt safety."""
-    try:
-        text = _PROJECT_CONTEXT_PATH.read_text(encoding="utf-8", errors="replace").strip()
-    except FileNotFoundError:
-        logger.warning("Project context file not found at %s", _PROJECT_CONTEXT_PATH)
-        return ""
-    except OSError as exc:
-        logger.warning("Could not read project context file %s: %s", _PROJECT_CONTEXT_PATH, exc)
-        return ""
-
-    if len(text) > _PROJECT_CONTEXT_MAX_CHARS:
-        return text[:_PROJECT_CONTEXT_MAX_CHARS] + "\n\n[...project context truncated...]"
-    return text
+    return _bot_utils.load_project_context(_PROJECT_CONTEXT_PATH)
 
 
 def _format_live_context() -> str:

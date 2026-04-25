@@ -7,9 +7,13 @@ read-only complex tasks through ``astra-node``.
 
 from __future__ import annotations
 
+import asyncio
+import json as _json
+import functools
 import uuid
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -19,6 +23,7 @@ from pydantic import BaseModel, Field
 
 from bot import approval
 from bot import capability_policy
+from bot import db as kira_db
 from bot import memory as kira_memory
 from bot import mode as kira_mode
 from bot import observer
@@ -27,14 +32,31 @@ from bot import provider
 from bot import scheduler
 from bot import task_state
 from bot import watchdog
+from bot.utils import load_project_context as _load_project_context, tail_text, truncate_text
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_PROJECT_CONTEXT_PATH = Path(
-    os.environ.get("PROJECT_CONTEXT_PATH", str(_PROJECT_ROOT / "context.md"))
-)
 _READ_ONLY_COMPLEX_TOOLS = ["file_read", "grep", "glob", "web_search"]
 _CONFIRMATION_TOOLS = ["bash", "registered_script_run", "test_command_run"]
 ApprovalCallback = Callable[[approval.ApprovalRequest], Awaitable[bool]]
+
+
+class TaskStage:
+    QUEUED            = "queued"
+    CONTEXT_READY     = "context_ready"
+    ANALYSIS_RUNNING  = "analysis_running"
+    TOOL_RUNNING      = "tool_running"
+    TOOL_RESULT       = "tool_result"
+    TOOL_ERROR        = "tool_error"
+    APPROVAL_PENDING  = "approval_pending"
+    APPROVAL_RESOLVED = "approval_resolved"
+    APPROVAL_ERROR    = "approval_error"
+    ENGINE_UNAVAIL    = "engine_unavailable"
+    COMPLETED         = "completed"
+
+
+class TaskSource:
+    LOCAL_VOICE = "local_voice"
+    TELEGRAM    = "telegram"
 
 
 @dataclass(frozen=True)
@@ -116,7 +138,15 @@ async def build_execution_context(
     policy_table = capability_policy.get_default_policy()
     memory_context = []
 
-    session_history = await kira_memory.get_recent_sessions(3)
+    # Fetch independent async sources concurrently
+    _gathered = await asyncio.gather(
+        kira_memory.get_recent_sessions(3),
+        kira_db.get_recent_world_snapshot(),
+        return_exceptions=True,
+    )
+    session_history = _gathered[0] if not isinstance(_gathered[0], BaseException) else None
+    world_snapshot  = _gathered[1] if not isinstance(_gathered[1], BaseException) else None
+
     if session_history:
         memory_context.append(session_history)
 
@@ -128,15 +158,11 @@ async def build_execution_context(
     if observer_context:
         memory_context.append(f"Machine awareness:\n{observer_context}")
 
-    project_context = observer.get_active_project_context()
-    if project_context:
-        memory_context.append(project_context)
+    active_project_ctx = observer.get_active_project_context()
+    if active_project_ctx:
+        memory_context.append(active_project_ctx)
 
-    from bot import db as kira_db
-    from datetime import datetime
-    world_snapshot = await kira_db.get_recent_world_snapshot()
     if world_snapshot:
-        import json as _json
         parts = [f"Time: {datetime.now().strftime('%A, %d %B %Y, %H:%M')}"]
         if world_snapshot.get("weather"):
             parts.append(f"Weather: {world_snapshot['weather']}")
@@ -223,7 +249,7 @@ async def run_complex_task_stream(
     _persist_task_state(
         task_request,
         status="running",
-        stage="queued",
+        stage=TaskStage.QUEUED,
         last_message="Task accepted for complex analysis.",
         checkpoint=checkpoint,
     )
@@ -231,7 +257,7 @@ async def run_complex_task_stream(
         task_id=task_request.task_id,
         event_type="status",
         message="Complex analysis started. Preparing task context...",
-        stage="queued",
+        stage=TaskStage.QUEUED,
     )
 
     execution_context = await build_execution_context(
@@ -242,7 +268,7 @@ async def run_complex_task_stream(
     _persist_task_state(
         task_request,
         status="running",
-        stage="context_ready",
+        stage=TaskStage.CONTEXT_READY,
         last_message="Execution context is ready.",
         execution_context=execution_context,
         checkpoint=checkpoint,
@@ -251,7 +277,7 @@ async def run_complex_task_stream(
         task_id=task_request.task_id,
         event_type="status",
         message="Context ready. Starting the read-only analysis engine...",
-        stage="context_ready",
+        stage=TaskStage.CONTEXT_READY,
     )
 
     try:
@@ -275,14 +301,14 @@ async def run_complex_task_stream(
         _persist_final_result(
             task_request,
             result,
-            stage="engine_unavailable",
+            stage=TaskStage.ENGINE_UNAVAIL,
             execution_context=execution_context,
         )
         yield BrainEvent(
             task_id=task_request.task_id,
             event_type="result",
             message=result.summary,
-            stage="engine_unavailable",
+            stage=TaskStage.ENGINE_UNAVAIL,
             result=result,
         )
         return
@@ -293,7 +319,7 @@ async def run_complex_task_stream(
     _persist_task_state(
         task_request,
         status="running",
-        stage="analysis_running",
+        stage=TaskStage.ANALYSIS_RUNNING,
         last_message="Read-only analysis is running.",
         execution_context=execution_context,
         tool_events=tool_events,
@@ -312,7 +338,7 @@ async def run_complex_task_stream(
             _persist_task_state(
                 task_request,
                 status="running",
-                stage=event.stage or "approval_pending",
+                stage=event.stage or TaskStage.APPROVAL_PENDING,
                 last_message=event.message,
                 execution_context=execution_context,
                 tool_events=tool_events,
@@ -328,6 +354,7 @@ async def run_complex_task_stream(
         if isinstance(event, TextDelta):
             text_parts.append(event.text)
         elif isinstance(event, ToolStart):
+            tool_msg = _describe_tool_start(event.tool_name, event.tool_input)
             tool_event = {
                 "type": event.type,
                 "tool_name": event.tool_name,
@@ -337,16 +364,16 @@ async def run_complex_task_stream(
             _persist_task_state(
                 task_request,
                 status="running",
-                stage="tool_running",
-                last_message=_describe_tool_start(event.tool_name, event.tool_input),
+                stage=TaskStage.TOOL_RUNNING,
+                last_message=tool_msg,
                 execution_context=execution_context,
                 tool_events=tool_events,
             )
             yield BrainEvent(
                 task_id=task_request.task_id,
                 event_type="tool",
-                message=_describe_tool_start(event.tool_name, event.tool_input),
-                stage="tool_running",
+                message=tool_msg,
+                stage=TaskStage.TOOL_RUNNING,
                 details=tool_event,
             )
         elif isinstance(event, ToolResult):
@@ -354,13 +381,13 @@ async def run_complex_task_stream(
                 "type": event.type,
                 "tool_name": event.tool_name,
                 "is_error": event.is_error,
-                "output_tail": _tail_text(event.output, 2000),
+                "output_tail": tail_text(event.output, 2000),
             }
             tool_events.append(tool_event)
             _persist_task_state(
                 task_request,
                 status="running",
-                stage="tool_result",
+                stage=TaskStage.TOOL_RESULT,
                 last_message=_describe_tool_result(event.tool_name, event.is_error),
                 execution_context=execution_context,
                 tool_events=tool_events,
@@ -370,7 +397,7 @@ async def run_complex_task_stream(
                     task_id=task_request.task_id,
                     event_type="warning",
                     message=_describe_tool_result(event.tool_name, True),
-                    stage="tool_result",
+                    stage=TaskStage.TOOL_RESULT,
                     details=tool_event,
                 )
         elif isinstance(event, AgentError):
@@ -384,7 +411,7 @@ async def run_complex_task_stream(
             _persist_task_state(
                 task_request,
                 status="running",
-                stage="tool_error",
+                stage=TaskStage.TOOL_ERROR,
                 last_message=error_message,
                 execution_context=execution_context,
                 tool_events=tool_events,
@@ -393,7 +420,7 @@ async def run_complex_task_stream(
                 task_id=task_request.task_id,
                 event_type="warning",
                 message=error_message,
-                stage="tool_error",
+                stage=TaskStage.TOOL_ERROR,
                 details=tool_event,
             )
         elif isinstance(event, TurnEnd):
@@ -425,7 +452,7 @@ async def run_complex_task_stream(
     _persist_final_result(
         task_request,
         result,
-        stage="completed",
+        stage=TaskStage.COMPLETED,
         execution_context=execution_context,
         tool_events=tool_events,
     )
@@ -433,7 +460,7 @@ async def run_complex_task_stream(
         task_id=task_request.task_id,
         event_type="result",
         message=result.summary,
-        stage="completed",
+        stage=TaskStage.COMPLETED,
         details={"tool_event_count": len(tool_events)},
         result=result,
     )
@@ -518,12 +545,13 @@ class _WebSearchTool(BaseTool):
         return ToolResult.ok("\n\n".join(lines))
 
 
-def _readable_roots() -> list[Path]:
+@functools.lru_cache(maxsize=1)
+def _readable_roots() -> tuple[Path, ...]:
     """Return paths Kira is allowed to read, from KIRA_READABLE_ROOTS env var."""
     raw = os.environ.get("KIRA_READABLE_ROOTS", "").strip()
     if not raw:
-        return []
-    return [Path(p.strip()).resolve() for p in raw.split(",") if p.strip()]
+        return ()
+    return tuple(Path(p.strip()).resolve() for p in raw.split(",") if p.strip())
 
 
 class _KiraFileReadTool(BaseTool):
@@ -551,7 +579,7 @@ class _KiraFileReadTool(BaseTool):
 
         cwd_resolved = ctx.cwd.resolve()
         extra_roots = _readable_roots()
-        allowed = [cwd_resolved] + extra_roots
+        allowed = (cwd_resolved,) + extra_roots
 
         if not any(path.is_relative_to(root) for root in allowed):
             readable = ", ".join(str(r) for r in extra_roots) or "none configured"
@@ -560,11 +588,10 @@ class _KiraFileReadTool(BaseTool):
                 f"(readable roots: {readable})"
             )
 
-        # Delegate the actual read to the base tool's logic (blocked patterns, etc.)
-        # by temporarily pointing cwd to the matching root so is_relative_to passes.
+        # BaseFileTool re-checks is_relative_to(cwd) internally, so supply the
+        # matched root as cwd rather than the global project root.
         matching_root = next(r for r in allowed if path.is_relative_to(r))
-        fake_ctx = ToolContext(cwd=matching_root)
-        return _Base().execute(input, fake_ctx)
+        return _Base().execute(input, ToolContext(cwd=matching_root))
 
 
 def _build_runtime_components(
@@ -642,16 +669,24 @@ async def _run_agent_loop_with_approvals(
     check_injection(task_request.user_input)
     history.add_user(wrap_user_message(task_request.user_input))
 
+    def _tool_error_events(tc_id, tc_name, error_msg, *, recoverable=False):
+        """Yield the standard ToolResult + AgentError pair for a failed tool call."""
+        history.add_tool_result(tc_id, error_msg, is_error=True)
+        return [
+            ToolResult(tool_use_id=tc_id, tool_name=tc_name, output=error_msg, is_error=True),
+            AgentError(error=error_msg, tool_name=tc_name, tool_use_id=tc_id, recoverable=recoverable),
+        ]
+
     turns_used = 0
     text_emitted = False
+    system_prompt = _build_system_prompt(execution_context)
+    provider_name = _detect_provider_name(llm_provider)
+    tool_schemas = registry.to_api_format(provider_name)
 
     while turns_used < int(execution_context.config.get("max_turns", 6)):
         turns_used += 1
 
-        provider_name = _detect_provider_name(llm_provider)
-        tool_schemas = registry.to_api_format(provider_name)
         messages = history.to_api_format(provider_name)
-        system_prompt = _build_system_prompt(execution_context)
 
         async for event in llm_provider.complete(
             messages=messages,
@@ -698,19 +733,8 @@ async def _run_agent_loop_with_approvals(
                 try:
                     tool = registry.get(tc.name)
                 except KeyError:
-                    error_msg = f"Tool '{tc.name}' is not registered."
-                    history.add_tool_result(tc.id, error_msg, is_error=True)
-                    yield ToolResult(
-                        tool_use_id=tc.id,
-                        tool_name=tc.name,
-                        output=error_msg,
-                        is_error=True,
-                    )
-                    yield AgentError(
-                        error=error_msg,
-                        tool_name=tc.name,
-                        tool_use_id=tc.id,
-                    )
+                    for ev in _tool_error_events(tc.id, tc.name, f"Tool '{tc.name}' is not registered."):
+                        yield ev
                     continue
 
                 decision = permission_manager.check_level(
@@ -736,7 +760,7 @@ async def _run_agent_loop_with_approvals(
                         task_id=task_request.task_id,
                         event_type="approval_request",
                         message=_describe_approval_request(approval_request),
-                        stage="approval_pending",
+                        stage=TaskStage.APPROVAL_PENDING,
                         details={
                             "tool_name": approval_request.tool_name,
                             "tool_input": approval_request.tool_input,
@@ -752,7 +776,7 @@ async def _run_agent_loop_with_approvals(
                             task_id=task_request.task_id,
                             event_type="warning",
                             message=f"Approval handling failed: {exc}",
-                            stage="approval_error",
+                            stage=TaskStage.APPROVAL_ERROR,
                             details={"request_id": approval_request.request_id},
                             approval_request=approval_request,
                         )
@@ -766,7 +790,7 @@ async def _run_agent_loop_with_approvals(
                             task_id=task_request.task_id,
                             event_type="approval_result",
                             message=resolution_message,
-                            stage="approval_resolved",
+                            stage=TaskStage.APPROVAL_RESOLVED,
                             details={
                                 "request_id": approval_request.request_id,
                                 "approved": approved,
@@ -779,38 +803,15 @@ async def _run_agent_loop_with_approvals(
                         decision = PermissionDecision.DENY
 
                 if decision == PermissionDecision.DENY:
-                    exc = PermissionDeniedError(tc.name, tc.input)
-                    error_msg = str(exc)
-                    history.add_tool_result(tc.id, error_msg, is_error=True)
-                    yield ToolResult(
-                        tool_use_id=tc.id,
-                        tool_name=tc.name,
-                        output=error_msg,
-                        is_error=True,
-                    )
-                    yield AgentError(
-                        error=error_msg,
-                        tool_name=tc.name,
-                        tool_use_id=tc.id,
-                    )
+                    for ev in _tool_error_events(tc.id, tc.name, str(PermissionDeniedError(tc.name, tc.input))):
+                        yield ev
                     continue
 
                 try:
                     validated_input = tool.input_schema(**tc.input)
                 except ValidationError as exc:
-                    error_msg = f"Invalid input for tool '{tc.name}': {exc}"
-                    history.add_tool_result(tc.id, error_msg, is_error=True)
-                    yield ToolResult(
-                        tool_use_id=tc.id,
-                        tool_name=tc.name,
-                        output=error_msg,
-                        is_error=True,
-                    )
-                    yield AgentError(
-                        error=error_msg,
-                        tool_name=tc.name,
-                        tool_use_id=tc.id,
-                    )
+                    for ev in _tool_error_events(tc.id, tc.name, f"Invalid input for tool '{tc.name}': {exc}"):
+                        yield ev
                     continue
 
                 ctx = ToolContext(
@@ -819,20 +820,8 @@ async def _run_agent_loop_with_approvals(
                 try:
                     result = tool.execute(validated_input, ctx)
                 except Exception as exc:
-                    error_msg = f"Unexpected error in tool '{tc.name}': {exc}"
-                    history.add_tool_result(tc.id, error_msg, is_error=True)
-                    yield ToolResult(
-                        tool_use_id=tc.id,
-                        tool_name=tc.name,
-                        output=error_msg,
-                        is_error=True,
-                    )
-                    yield AgentError(
-                        error=error_msg,
-                        tool_name=tc.name,
-                        tool_use_id=tc.id,
-                        recoverable=True,
-                    )
+                    for ev in _tool_error_events(tc.id, tc.name, f"Unexpected error in tool '{tc.name}': {exc}", recoverable=True):
+                        yield ev
                     continue
                 tool_output = result.output
                 if not result.is_error and tool_output:
@@ -878,55 +867,62 @@ def _detect_provider_name(llm_provider: Any) -> str:
 def _build_system_prompt(execution_context: ExecutionContext) -> str:
     """Build the system prompt for Kira's complex task runtime."""
     source = execution_context.state_snapshot.get("task_source", "")
-
-    if source == "local_voice":
-        from bot import identity as kira_identity
-        identity_block = kira_identity.get_identity_prompt()
-        user_name = kira_identity.get_user_name()
-        sections = [
-            (
-                f"{identity_block}\n\n"
-                "Rules:\n"
-                f"- Address the user as '{user_name}' occasionally but not every response.\n"
-                "- Speak naturally, like a real person. Use contractions.\n"
-                "- Never start with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
-                "- Match response length to the question. One sentence for simple facts. Two to three sentences max for complex ones.\n"
-                "- No markdown, no bullet points, no headers. Your response is read aloud via TTS.\n"
-                "- Be confident and direct. Skip filler phrases like 'Great question' or 'I think'.\n"
-                "- Never mention being an AI or having limitations unless directly asked.\n"
-                "- If screen context is provided, use it to give more relevant answers."
-            ),
-            (
-                "Always use web_search for current events, news, weather, prices, sports scores, "
-                "or anything time-sensitive. Search before admitting you don't know."
-            ),
-            "Available tools: " + ", ".join(execution_context.available_tools),
-            "State snapshot:\n" + _format_state_snapshot(execution_context.state_snapshot),
-        ]
+    if source == TaskSource.LOCAL_VOICE:
+        sections = _build_voice_system_prompt(execution_context)
     else:
-        sections = [
-            (
-                "You are Kira, a personal AI collaborator running on a Windows machine. "
-                "For this task you are in read-only complex analysis mode."
-            ),
-            (
-                "You may inspect the codebase and machine context using the available "
-                "read-only tools. Do not claim to have changed files, run mutating "
-                "commands, or taken actions you cannot perform."
-            ),
-            (
-                "Any action that would normally require confirmation must go through "
-                "Kira's explicit approval flow before it can run."
-            ),
-            "Available tools: " + ", ".join(execution_context.available_tools),
-            "Capability policy: " + str(execution_context.capability_policy),
-            "State snapshot:\n" + _format_state_snapshot(execution_context.state_snapshot),
-        ]
+        sections = _build_telegram_system_prompt(execution_context)
 
     if execution_context.memory_context:
         sections.append("\n\n".join(execution_context.memory_context))
 
     return "\n\n".join(section for section in sections if section).strip()
+
+
+def _build_voice_system_prompt(execution_context: ExecutionContext) -> list[str]:
+    from bot import identity as kira_identity
+    identity_block = kira_identity.get_identity_prompt()
+    user_name = kira_identity.get_user_name()
+    return [
+        (
+            f"{identity_block}\n\n"
+            "Rules:\n"
+            f"- Address the user as '{user_name}' occasionally but not every response.\n"
+            "- Speak naturally, like a real person. Use contractions.\n"
+            "- Never start with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
+            "- Match response length to the question. One sentence for simple facts. Two to three sentences max for complex ones.\n"
+            "- No markdown, no bullet points, no headers. Your response is read aloud via TTS.\n"
+            "- Be confident and direct. Skip filler phrases like 'Great question' or 'I think'.\n"
+            "- Never mention being an AI or having limitations unless directly asked.\n"
+            "- If screen context is provided, use it to give more relevant answers."
+        ),
+        (
+            "Always use web_search for current events, news, weather, prices, sports scores, "
+            "or anything time-sensitive. Search before admitting you don't know."
+        ),
+        "Available tools: " + ", ".join(execution_context.available_tools),
+        "State snapshot:\n" + _format_state_snapshot(execution_context.state_snapshot),
+    ]
+
+
+def _build_telegram_system_prompt(execution_context: ExecutionContext) -> list[str]:
+    return [
+        (
+            "You are Kira, a personal AI collaborator running on a Windows machine. "
+            "For this task you are in read-only complex analysis mode."
+        ),
+        (
+            "You may inspect the codebase and machine context using the available "
+            "read-only tools. Do not claim to have changed files, run mutating "
+            "commands, or taken actions you cannot perform."
+        ),
+        (
+            "Any action that would normally require confirmation must go through "
+            "Kira's explicit approval flow before it can run."
+        ),
+        "Available tools: " + ", ".join(execution_context.available_tools),
+        "Capability policy: " + str(execution_context.capability_policy),
+        "State snapshot:\n" + _format_state_snapshot(execution_context.state_snapshot),
+    ]
 
 
 def _persist_task_state(
@@ -975,7 +971,7 @@ def _persist_task_state(
     if result is not None:
         payload["result"] = {
             "status": result.status,
-            "summary": _truncate_text(result.summary, 4000),
+            "summary": truncate_text(result.summary, 4000),
             "retryable": result.retryable,
         }
 
@@ -1005,7 +1001,7 @@ def _persist_final_result(
 def _serialize_execution_context(execution_context: ExecutionContext) -> dict[str, Any]:
     """Serialize a compact execution context snapshot for task-state files."""
     return {
-        "memory_context": [_truncate_text(entry, 2000) for entry in execution_context.memory_context],
+        "memory_context": [truncate_text(entry, 2000) for entry in execution_context.memory_context],
         "state_snapshot": execution_context.state_snapshot,
         "available_tools": execution_context.available_tools,
         "capability_policy": execution_context.capability_policy,
@@ -1044,23 +1040,6 @@ def _format_state_snapshot(state_snapshot: dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
-
-def _load_project_context() -> str:
-    """Return the project context file content, bounded for prompt safety."""
-    try:
-        text = _PROJECT_CONTEXT_PATH.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
-        return ""
-    if len(text) > 12000:
-        return text[:12000] + "\n\n[...project context truncated...]"
-    return text
-
-
-def _truncate_text(text: str, max_chars: int) -> str:
-    """Truncate text while preserving a clear overflow marker."""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "\n\n[...truncated...]"
 
 
 def _describe_tool_start(tool_name: str, tool_input: Any) -> str:
@@ -1120,8 +1099,3 @@ def _describe_approval_request(request: approval.ApprovalRequest) -> str:
     )
 
 
-def _tail_text(text: str, max_chars: int) -> str:
-    """Return a bounded tail for persisted tool output."""
-    if len(text) <= max_chars:
-        return text
-    return "[...output truncated...]\n" + text[-max_chars:]

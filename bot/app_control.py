@@ -40,7 +40,18 @@ class ModeDefinition:
     aliases: list[str] = field(default_factory=list)
     open_apps: list[str] = field(default_factory=list)
     close_apps: list[str] = field(default_factory=list)
+    chain_modes: list[str] = field(default_factory=list)
     say: str = ""
+
+
+@dataclass(frozen=True)
+class IntentDefinition:
+    """One configured natural-language shortcut intent."""
+
+    name: str
+    aliases: list[str] = field(default_factory=list)
+    command: str = ""
+    args: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -49,6 +60,7 @@ class AppsConfig:
 
     apps: dict[str, AppDefinition] = field(default_factory=dict)
     modes: dict[str, ModeDefinition] = field(default_factory=dict)
+    intents: dict[str, IntentDefinition] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -69,6 +81,7 @@ def load_apps_config(path: Path | None = None) -> AppsConfig:
     loaded = toml.load(config_path)
     raw_apps = loaded.get("apps", {})
     raw_modes = loaded.get("modes", {})
+    raw_intents = loaded.get("intents", {})
 
     apps: dict[str, AppDefinition] = {}
     if isinstance(raw_apps, dict):
@@ -98,10 +111,26 @@ def load_apps_config(path: Path | None = None) -> AppsConfig:
                 aliases=_string_list(raw.get("aliases", [])),
                 open_apps=[_normalize_key(item) for item in _string_list(raw.get("open", []))],
                 close_apps=[_normalize_key(item) for item in _string_list(raw.get("close", []))],
+                chain_modes=[_normalize_key(item) for item in _string_list(raw.get("chain", []))],
                 say=str(raw.get("say", "")).strip(),
             )
 
-    return AppsConfig(apps=apps, modes=modes)
+    intents: dict[str, IntentDefinition] = {}
+    if isinstance(raw_intents, dict):
+        for intent_name, raw in raw_intents.items():
+            if not isinstance(raw, dict):
+                continue
+            key = _normalize_key(intent_name)
+            command = str(raw.get("command", "")).strip()
+            if key and command:
+                intents[key] = IntentDefinition(
+                    name=key,
+                    aliases=_string_list(raw.get("aliases", [])),
+                    command=command,
+                    args=_string_list(raw.get("args", [])),
+                )
+
+    return AppsConfig(apps=apps, modes=modes, intents=intents)
 
 
 def find_app(name: str, config: AppsConfig | None = None) -> AppDefinition | None:
@@ -135,6 +164,22 @@ def find_mode(phrase: str, config: AppsConfig | None = None) -> ModeDefinition |
     return None
 
 
+def find_intent(phrase: str, config: AppsConfig | None = None) -> IntentDefinition | None:
+    """Find an intent by name or alias."""
+    apps_config = config or load_apps_config()
+    normalized = _normalize_phrase(phrase)
+    key = _normalize_key(phrase)
+    if key in apps_config.intents:
+        return apps_config.intents[key]
+
+    for intent in apps_config.intents.values():
+        if normalized == _normalize_phrase(intent.name):
+            return intent
+        if any(normalized == _normalize_phrase(alias) for alias in intent.aliases):
+            return intent
+    return None
+
+
 def open_app(app_name: str, config: AppsConfig | None = None) -> ActionResult:
     """Open a configured app, falling back to a sanitized app name.
 
@@ -147,11 +192,11 @@ def open_app(app_name: str, config: AppsConfig | None = None) -> ActionResult:
     close_terms = app.close_names if app and app.close_names else [app_name]
     running = _matching_processes(close_terms)
     if running:
-        focused = _focus_process(running[0])
+        focused = _focus_window_for_pid(running[0].pid)
         label = app.name if app else app_name
         if focused:
-            return ActionResult(ok=True, message=f"{label} is already running — focused.", spoken=f"{label} is already open.")
-        return ActionResult(ok=True, message=f"{label} is already running.", spoken=f"{label} is already open.")
+            return ActionResult(ok=True, message=f"{label} is already open — focused.", spoken=f"{label} is already open.")
+        return ActionResult(ok=True, message=f"{label} is already open.", spoken=f"{label} is already open.")
 
     if app is not None:
         return _launch_command(app.open_command, app.name)
@@ -237,6 +282,11 @@ def run_mode(mode_name: str, config: AppsConfig | None = None) -> ActionResult:
         result = open_app(app_name, apps_config)
         parts.append(result.message)
         ok = ok and result.ok
+
+    for chained_mode in mode.chain_modes:
+        chained_result = run_mode(chained_mode, apps_config)
+        parts.append(chained_result.message)
+        ok = ok and chained_result.ok
 
     spoken = mode.say or f"{mode.name.title()} mode is ready."
     parts.append(spoken)
@@ -383,6 +433,14 @@ def _focus_process(proc: psutil.Process) -> bool:
         return True
     except Exception as exc:
         logger.debug("Could not focus window for PID %d: %s", proc.pid, exc)
+        return False
+
+
+def _focus_window_for_pid(pid: int) -> bool:
+    """Compatibility wrapper used by tests and call sites that only have a PID."""
+    try:
+        return _focus_process(psutil.Process(pid))
+    except Exception:
         return False
 
 
