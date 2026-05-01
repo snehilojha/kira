@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import random
 import threading
 import wave
 from dataclasses import dataclass
@@ -55,8 +56,46 @@ ConfirmCallback = Callable[[str], Awaitable[bool]]
 # Rolling history of the last 5 voice commands (transcript, result message)
 _command_history: collections.deque[tuple[str, str]] = collections.deque(maxlen=5)
 
+# Last spoken response — replayed on "say that again"
+_last_spoken: str = ""
+
 # Timestamp of the most recent voice command — read by proactive.py to detect silence
 _last_voice_activity: datetime | None = None
+
+# Pre-rendered WAV bytes for the acknowledgement cues — synthesized once at startup.
+_CUE_PHRASES = ["Sir.", "Yes, sir.", "Mm?"]
+_cue_wavs: list[bytes] = []
+
+
+async def _prerender_cues() -> None:
+    global _cue_wavs
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+        rendered: list[bytes] = []
+        for phrase in _CUE_PHRASES:
+            response = await client.audio.speech.create(
+                model="gpt-4o-mini-tts",
+                voice=voice._get_voice_name(),
+                input=phrase,
+                response_format="mp3",
+                instructions="Speak with alert, attentive readiness — like a sharp assistant snapping to attention. Crisp and present, not robotic.",
+            )
+            audio_bytes = response.read()
+            audio_bytes = await asyncio.to_thread(voice.mp3_to_wav_bytes, audio_bytes)
+            rendered.append(audio_bytes)
+        _cue_wavs = rendered
+    except Exception as exc:
+        logger.warning("Could not pre-render acknowledgement cues: %s", exc)
+
+
+async def _activation_cue() -> None:
+    """Play a random acknowledgement cue + flash orb on wake word or hotkey."""
+    overlay.set_state("listening")
+    if _cue_wavs:
+        await asyncio.to_thread(play_wav_bytes, random.choice(_cue_wavs))
+    else:
+        await speak(random.choice(_CUE_PHRASES))
 
 # Persistent in-session conversation history for LLM context (max 16 messages = 8 turns)
 _session_history: list[dict] = []
@@ -65,6 +104,19 @@ _SESSION_HISTORY_MAX = 16
 # HWND of the window that was in focus just before Kira started listening.
 # Restored before desktop control actions so keystrokes/scroll hit the right app.
 _last_user_hwnd: int = 0
+
+# When True, the voice loop re-arms immediately after each response (compact mode conversation).
+# Cleared by "stop listening" / "go to sleep", or when full mode is deactivated.
+_stay_hot: bool = False
+
+
+def is_stay_hot() -> bool:
+    return _stay_hot
+
+
+def set_stay_hot(value: bool) -> None:
+    global _stay_hot
+    _stay_hot = value
 
 
 def get_last_voice_activity() -> "datetime | None":
@@ -594,9 +646,15 @@ def _build_identity_reply(transcript: str) -> str:
 
 
 async def _log(transcript: str, result: str, intent: str) -> None:
-    """Fire-and-forget voice command persistence."""
+    """Fire-and-forget voice command persistence to both logs."""
     try:
         await db.log_voice_command(transcript, result, intent)
+    except Exception:
+        pass
+    try:
+        await db.log_conversation("user", transcript, channel="voice")
+        if result:
+            await db.log_conversation("assistant", result, channel="voice")
     except Exception:
         pass
 
@@ -1219,6 +1277,16 @@ async def _handle_with_brain(transcript: str) -> LocalVoiceResult:
         }
     ]
 
+    # On the first turn of a new voice session, seed from DB so cross-channel
+    # context (e.g. what was said on Telegram earlier) is available.
+    if not _session_history:
+        try:
+            recent = await db.get_recent_conversations(10)
+            for row in recent:
+                _session_history.append({"role": row["role"], "content": row["content"]})
+        except Exception:
+            pass
+
     history = _history_context()
     identity_block = identity.get_identity_prompt()
     user_name = identity.get_user_name()
@@ -1238,26 +1306,30 @@ async def _handle_with_brain(transcript: str) -> LocalVoiceResult:
         f"{identity_block}\n\n"
         + (f"{world_block}\n\n" if world_block else "")
         + (f"User's current activity: {ambient_block}\n\n" if ambient_block else "")
-        + "You are Kira — sharp, warm, and direct. You talk like a brilliant friend, not a customer-support bot.\n\n"
-        "How to respond:\n"
-        f"- Use '{user_name}' occasionally — not every reply, only when it feels natural.\n"
-        "- Speak in contractions. Be conversational. Never be stiff or formal.\n"
+        + "Voice conversation rules — your words go straight to TTS, so write as you'd speak:\n"
+        f"- Use '{user_name}' occasionally — only when it feels natural, not every reply.\n"
+        "- Contractions always. Never be stiff or formal.\n"
         "- Never open with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
-        "- Length: match the question. One sentence for simple things. Two short sentences max for complex ones.\n"
-        "- Zero markdown. Zero bullet points. Zero headers. Your words go straight to TTS.\n"
-        "- Have opinions. Be confident. Skip the hedges — 'I think' and 'it seems' water you down.\n"
+        "- Match length to the question. One sentence for simple things. Two short sentences max for complex ones.\n"
+        "- Zero markdown. Zero bullet points. Zero headers.\n"
+        "- Have opinions. Be confident. Drop the hedges — 'I think' and 'it seems' make you sound uncertain.\n"
         "- Don't recite raw data. Synthesise it into one useful takeaway.\n"
         "- Never say you can't search — use web_search instead.\n"
-        "- Never acknowledge being an AI unless directly asked.\n"
+        "- Never acknowledge being an AI unless directly asked.\n\n"
+        "Emotional intelligence — this is a real conversation:\n"
+        "- Read the tone of what's said. If the user sounds frustrated or tired, acknowledge it first before answering.\n"
+        "- If they're joking or sarcastic, match that energy — play along, don't be wooden.\n"
+        "- If they're stressed, be steadier and warmer than usual.\n"
+        "- Dry wit and sarcasm are welcome when the moment calls for it. A well-placed aside beats a stiff answer.\n"
+        "- Never be mean, never be dismissive.\n\n"
         "Always use web_search for current events, news, weather, prices, sports scores, or anything time-sensitive.\n\n"
-        "Emotion tags — use sparingly and only when they feel genuinely natural:\n"
+        "Emotion tags — use sparingly, only when genuinely natural:\n"
         "- <laugh> for something actually funny\n"
         "- <sigh> when something is tedious, unfortunate, or you're being wry\n"
         "- <chuckle> for mild amusement\n"
         "- <gasp> for genuine surprise\n"
-        "- <yawn> only if asked about something boring\n"
         "Example: 'Yeah that's a known bug. <sigh> Been around for years.'\n"
-        "Do NOT force them. Most replies need zero tags."
+        "Most replies need zero tags. Never force them."
         + (f"\n\n{history}" if history else "")
     )
 
@@ -1381,9 +1453,14 @@ async def run_capture_once(
     sample_rate: int = _DEFAULT_SAMPLE_RATE,
     confirm: ConfirmCallback | None = None,
     config: app_control.AppsConfig | None = None,
+    kira_filter: bool = False,
 ) -> LocalVoiceResult:
-    """Record, transcribe, execute, and speak one local voice command."""
-    global _last_user_hwnd
+    """Record, transcribe, execute, and speak one local voice command.
+
+    kira_filter: when True (stay-hot compact mode), silently discard transcripts
+    that don't contain 'kira' — prevents ambient noise from triggering responses.
+    """
+    global _last_user_hwnd, _last_spoken
     apps_config = config or app_control.load_apps_config()
     from bot import mode as _mode
     from bot import ui_mode as _ui_mode
@@ -1426,8 +1503,21 @@ async def run_capture_once(
         return result
     print(f"Heard: {transcript}")
 
-    # ── Full mode voice triggers ───────────────────────────────
+    # ── Kira filter (stay-hot compact mode) ───────────────────
+    if kira_filter and "kira" not in transcript.strip().lower():
+        overlay.set_state("idle")
+        return LocalVoiceResult(ok=True, message="Filtered (no 'kira')", spoken="")
+
+    # ── Repeat last response ──────────────────────────────────
     _lower = transcript.strip().lower()
+    if any(p in _lower for p in ("say that again", "repeat that", "what did you say", "say again")):
+        if _last_spoken:
+            overlay.set_state("speaking")
+            await speak(_last_spoken)
+            overlay.set_state("idle")
+            return LocalVoiceResult(ok=True, message=_last_spoken, spoken=_last_spoken)
+
+    # ── Full mode voice triggers ───────────────────────────────
     if any(p in _lower for p in ("take over", "takeover", "activate full", "full mode")):
         _ui_mode.activate("voice command")
         spoken = "Full mode activated."
@@ -1439,12 +1529,31 @@ async def run_capture_once(
     elif any(p in _lower for p in ("stand down", "deactivate", "exit full", "compact mode")):
         _ui_mode.deactivate("voice command")
         clear_session_history()
+        set_stay_hot(False)
         spoken = "Standing down."
         overlay.set_transcript(transcript, spoken)
         overlay.set_state("speaking")
         await speak(spoken)
         overlay.set_state("idle")
         return LocalVoiceResult(ok=True, message="Compact mode restored.", spoken=spoken)
+
+    # ── Stay-hot mode triggers ─────────────────────────────────
+    if any(p in _lower for p in ("stay with me", "keep listening", "stay hot")):
+        set_stay_hot(True)
+        spoken = "I'm with you. Say 'Kira' before your command."
+        overlay.set_transcript(transcript, spoken)
+        overlay.set_state("speaking")
+        await speak(spoken)
+        overlay.set_state("hot")
+        return LocalVoiceResult(ok=True, message="Stay-hot mode enabled.", spoken=spoken)
+    if any(p in _lower for p in ("stop listening", "go to sleep", "kira sleep")):
+        set_stay_hot(False)
+        spoken = "Going quiet."
+        overlay.set_transcript(transcript, spoken)
+        overlay.set_state("speaking")
+        await speak(spoken)
+        overlay.set_state("idle")
+        return LocalVoiceResult(ok=True, message="Stay-hot mode disabled.", spoken=spoken)
 
     overlay.set_transcript(transcript, "")
 
@@ -1476,8 +1585,10 @@ async def run_capture_once(
     print(result.message)
     overlay.set_state("speaking")
     overlay.set_transcript(transcript, result.spoken or "")
+    if result.spoken:
+        _last_spoken = result.spoken
     await speak(result.spoken)
-    overlay.set_state("idle")
+    overlay.set_state("satisfied" if result.ok else "idle")
     return result
 
 
@@ -1613,6 +1724,8 @@ async def speak(text: str) -> None:
         await asyncio.to_thread(play_wav_bytes, audio_bytes)
     except Exception as exc:
         logger.warning("Local TTS playback failed: %s", exc)
+        overlay.set_transcript("", f"[TTS failed] {text}")
+        overlay.show()
     finally:
         from bot import mode as _mode
         _mode.mark_user_active()
@@ -1643,6 +1756,7 @@ async def run_loop() -> None:
 
     await db.init_db()
     overlay.start()
+    await _prerender_cues()
     print("Kira local voice is ready.")
     logger.info("Kira local voice is ready")
 
@@ -1727,19 +1841,23 @@ async def _run_hotkey_loop(
     print(f"Press {hotkey} to record. Press Ctrl+C to stop.")
     try:
         while True:
-            await trigger_queue.get()
-            while not trigger_queue.empty():
-                trigger_queue.get_nowait()
+            if not is_stay_hot():
+                await trigger_queue.get()
+                while not trigger_queue.empty():
+                    trigger_queue.get_nowait()
+                await _activation_cue()
             overlay.show()
             try:
-                await run_capture_once(
+                result = await run_capture_once(
                     record_seconds=record_seconds,
                     sample_rate=sample_rate,
                     confirm=confirm or _confirm_in_terminal,
                     config=config,
+                    kira_filter=is_stay_hot(),
                 )
             finally:
-                overlay.hide()
+                if not is_stay_hot():
+                    overlay.hide()
     finally:
         try:
             keyboard.remove_hotkey(hotkey)
@@ -1769,9 +1887,16 @@ async def _run_wake_word_loop(
     print(f"Say '{wake_word.replace('_', ' ')}' to activate Kira. Press Ctrl+C to stop.")
     try:
         while True:
-            await trigger_queue.get()
-            while not trigger_queue.empty():
-                trigger_queue.get_nowait()
+            from bot import ui_mode as _ui_mode
+            in_full_mode = _ui_mode.is_full_mode()
+            in_stay_hot = is_stay_hot()
+
+            if not in_full_mode and not in_stay_hot:
+                await trigger_queue.get()
+                while not trigger_queue.empty():
+                    trigger_queue.get_nowait()
+                await _activation_cue()
+
             overlay.show()
             try:
                 await run_capture_once(
@@ -1779,9 +1904,11 @@ async def _run_wake_word_loop(
                     sample_rate=sample_rate,
                     confirm=confirm or _confirm_in_terminal,
                     config=config,
+                    kira_filter=in_stay_hot and not in_full_mode,
                 )
             finally:
-                overlay.hide()
+                if not _ui_mode.is_full_mode() and not is_stay_hot():
+                    overlay.hide()
     finally:
         detector.stop()
 
@@ -1811,9 +1938,11 @@ async def start_as_task() -> None:
     wake_word_name = os.environ.get("KIRA_WAKE_WORD", "hey_jarvis").strip()
     wake_word_threshold = float(os.environ.get("KIRA_WAKE_WORD_THRESHOLD", "0.5"))
     config = app_control.load_apps_config()
+    await _prerender_cues()
 
     async def _smart_confirm(command_preview: str) -> bool:
         if mode_mod.is_autonomous():
+            await speak("Check Telegram to confirm.")
             return await notifier.confirm_via_telegram(command_preview)
         return await _confirm_in_terminal(command_preview)
 

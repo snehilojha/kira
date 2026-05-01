@@ -59,9 +59,13 @@ async def init_db(db_path: Path | str | None = None) -> None:
 
     # Add columns introduced after initial schema (ALTER TABLE IF NOT EXISTS is not
     # supported in older SQLite — catch the "duplicate column" error instead)
-    for col, typedef in [("weather", "TEXT"), ("stocks", "TEXT")]:
+    for table, col, typedef in [
+        ("world_snapshots", "weather", "TEXT"),
+        ("world_snapshots", "stocks", "TEXT"),
+        ("conversation_log", "channel", "TEXT NOT NULL DEFAULT 'telegram'"),
+    ]:
         try:
-            await _conn.execute(f"ALTER TABLE world_snapshots ADD COLUMN {col} {typedef}")
+            await _conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
             await _conn.commit()
         except Exception:
             pass  # column already exists
@@ -92,7 +96,8 @@ CREATE TABLE IF NOT EXISTS conversation_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp  TEXT    NOT NULL DEFAULT (datetime('now')),
     role       TEXT    NOT NULL,  -- 'user' or 'assistant'
-    content    TEXT    NOT NULL
+    content    TEXT    NOT NULL,
+    channel    TEXT    NOT NULL DEFAULT 'telegram'  -- 'telegram' or 'voice'
 );
 
 CREATE TABLE IF NOT EXISTS run_history (
@@ -206,30 +211,31 @@ CREATE TABLE IF NOT EXISTS voice_log (
 
 # ── Conversation helpers ──────────────────────────────────────────
 
-async def log_conversation(role: str, content: str) -> None:
+async def log_conversation(role: str, content: str, channel: str = "telegram") -> None:
     """Insert a conversation entry.
 
     Args:
         role: ``"user"`` or ``"assistant"``.
         content: The message text (truncated to 4000 chars for safety).
+        channel: ``"telegram"`` or ``"voice"``.
     """
     conn = _get_conn()
     await conn.execute(
-        "INSERT INTO conversation_log (role, content) VALUES (?, ?)",
-        (role, content[:4000]),
+        "INSERT INTO conversation_log (role, content, channel) VALUES (?, ?, ?)",
+        (role, content[:4000], channel),
     )
     await conn.commit()
 
 
 async def get_recent_conversations(n: int = 10) -> list[dict[str, Any]]:
-    """Return the last *n* conversation entries, oldest first.
+    """Return the last *n* conversation entries across all channels, oldest first.
 
     Returns:
-        List of dicts with keys: ``id``, ``timestamp``, ``role``, ``content``.
+        List of dicts with keys: ``id``, ``timestamp``, ``role``, ``content``, ``channel``.
     """
     conn = _get_conn()
     cursor = await conn.execute(
-        "SELECT id, timestamp, role, content "
+        "SELECT id, timestamp, role, content, channel "
         "FROM conversation_log ORDER BY id DESC LIMIT ?",
         (n,),
     )

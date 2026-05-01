@@ -172,6 +172,8 @@ async def _loop(speak_fn: SpeakFn) -> None:
             spoken_at = _last_spoken
             try:
                 from bot import overlay as _overlay
+                _overlay.set_state("alert")
+                await asyncio.sleep(1.5)
                 _overlay.set_state("speaking")
             except Exception:
                 pass

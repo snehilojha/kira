@@ -317,12 +317,12 @@ async def run_complex_task_stream(
     tool_events: list[dict[str, Any]] = []
     _tool_call_count = 0
     _NARRATION_EVERY = 3
-    _NARRATION_LINES = [
-        "Still working on it.",
-        "Still on it — making progress.",
-        "Hang tight, almost there.",
-        "Still working — pulling it together now.",
-        "One more moment.",
+    _NARRATION_SUFFIXES = [
+        "still on it.",
+        "bear with me.",
+        "pulling it together.",
+        "nearly there.",
+        "one more moment.",
     ]
 
     _persist_task_state(
@@ -365,9 +365,10 @@ async def run_complex_task_stream(
         elif isinstance(event, ToolStart):
             _tool_call_count += 1
             if _tool_call_count % _NARRATION_EVERY == 0:
-                narration = _NARRATION_LINES[
-                    (_tool_call_count // _NARRATION_EVERY - 1) % len(_NARRATION_LINES)
+                suffix = _NARRATION_SUFFIXES[
+                    (_tool_call_count // _NARRATION_EVERY - 1) % len(_NARRATION_SUFFIXES)
                 ]
+                narration = _narration_for_tool(event.tool_name, event.tool_input, suffix)
                 yield BrainEvent(
                     task_id=task_request.task_id,
                     event_type="narration",
@@ -876,6 +877,43 @@ async def _run_agent_loop_with_approvals(
     yield TurnEnd(stop_reason="max_turns")
 
 
+def _narration_for_tool(tool_name: str, tool_input: dict[str, Any], suffix: str) -> str:
+    """Build a natural-language narration line describing what tool is running."""
+    _tool_phrases: dict[str, str] = {
+        "file_read":           "reading a file",
+        "grep":                "searching through code",
+        "glob":                "scanning the file tree",
+        "web_search":          "searching the web",
+        "bash":                "running a command",
+        "registered_script_run": "running a script",
+        "test_command_run":    "running tests",
+    }
+    action = _tool_phrases.get(tool_name)
+    if action is None:
+        action = f"using {tool_name.replace('_', ' ')}"
+
+    # Try to add specifics from tool input
+    detail = ""
+    if tool_name == "file_read":
+        path = str(tool_input.get("path", tool_input.get("file_path", ""))).strip()
+        if path:
+            detail = f" — {path.split('/')[-1].split(chr(92))[-1]}"
+    elif tool_name in ("grep", "glob"):
+        pattern = str(tool_input.get("pattern", tool_input.get("query", ""))).strip()
+        if pattern:
+            detail = f" for {pattern[:40]!r}"
+    elif tool_name == "web_search":
+        query = str(tool_input.get("query", "")).strip()
+        if query:
+            detail = f" for {query[:40]!r}"
+    elif tool_name == "bash":
+        cmd = str(tool_input.get("command", "")).strip()
+        if cmd:
+            detail = f" — {cmd[:40]}"
+
+    return f"Still working — {action}{detail}, {suffix}"
+
+
 def _detect_provider_name(llm_provider: Any) -> str:
     """Return the provider wire format name for one provider instance."""
     class_name = type(llm_provider).__name__.lower()
@@ -905,15 +943,19 @@ def _build_voice_system_prompt(execution_context: ExecutionContext) -> list[str]
     return [
         (
             f"{identity_block}\n\n"
-            "Rules:\n"
-            f"- Address the user as '{user_name}' occasionally but not every response.\n"
-            "- Speak naturally, like a real person. Use contractions.\n"
-            "- Never start with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
-            "- Match response length to the question. One sentence for simple facts. Two to three sentences max for complex ones.\n"
-            "- No markdown, no bullet points, no headers. Your response is read aloud via TTS.\n"
-            "- Be confident and direct. Skip filler phrases like 'Great question' or 'I think'.\n"
+            "Voice conversation rules — your words go straight to TTS, so write as you'd speak:\n"
+            f"- Use '{user_name}' occasionally — only when it feels natural, not every reply.\n"
+            "- Contractions always. Never be stiff or formal.\n"
+            "- Never open with 'Certainly', 'Sure', 'Of course', 'Absolutely', or 'I'.\n"
+            "- Match length to the question. One sentence for simple things. Two to three sentences max for complex ones.\n"
+            "- Zero markdown. Zero bullet points. Zero headers.\n"
+            "- Have opinions. Be confident. Drop the hedges.\n"
             "- Never mention being an AI or having limitations unless directly asked.\n"
-            "- If screen context is provided, use it to give more relevant answers."
+            "- If screen context is provided, use it to give more relevant answers.\n\n"
+            "Emotional intelligence — this is a real conversation:\n"
+            "- Read the tone. If the user sounds frustrated or tired, acknowledge it before answering.\n"
+            "- If they're joking, match that energy. If they're stressed, be steadier and warmer.\n"
+            "- Dry wit is welcome when the moment calls for it. Never be mean or dismissive."
         ),
         (
             "Always use web_search for current events, news, weather, prices, sports scores, "

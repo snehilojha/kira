@@ -33,14 +33,17 @@ _running = False
 
 async def reflect_now() -> list[str]:
     """Run one reflection cycle. Returns the updated user.facts list."""
+    from bot import task_state as _task_state
+
     voice_rows   = await db.get_voice_log(days=7)
     sessions     = await db.get_recent_sessions(n=7)
     convos       = await db.get_recent_conversations(n=100)
+    task_states  = _task_state.list_recent_task_states(limit=20)
 
     identity     = _load_identity()
     current_facts = identity.get("user", {}).get("facts", [])
 
-    prompt = _build_prompt(voice_rows, sessions, convos, current_facts)
+    prompt = _build_prompt(voice_rows, sessions, convos, current_facts, task_states)
 
     client = provider.create_client()
     model  = provider.get_model("smart")
@@ -144,6 +147,7 @@ def _build_prompt(
     sessions: list[dict],
     convos: list[dict],
     current_facts: list[str],
+    task_states: list[dict] | None = None,
 ) -> str:
     parts: list[str] = []
 
@@ -158,6 +162,15 @@ def _build_prompt(
         parts.append(f"\n--- Voice commands this week ({len(voice_rows)} total) ---")
         for r in voice_rows[-60:]:  # cap to last 60 to stay within token budget
             parts.append(f"[{r['timestamp'][:16]}] ({r['intent']}) \"{r['transcript']}\" → {r['result'][:80]}")
+
+    if task_states:
+        parts.append(f"\n--- Recent brain task outcomes ({len(task_states)} tasks) ---")
+        for t in task_states[:20]:
+            status = t.get("status", "?")
+            stage = t.get("stage", "?")
+            user_input = t.get("task_request", {}).get("user_input", "")[:80]
+            last_msg = t.get("last_message", "")[:80]
+            parts.append(f"[{status}/{stage}] \"{user_input}\" → {last_msg}")
 
     if sessions:
         parts.append("\n--- Daily session summaries ---")
