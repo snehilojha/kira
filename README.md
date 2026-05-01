@@ -1,6 +1,35 @@
-# kira
+# KIRA
 
-A persistent background service running on your Windows PC that accepts commands from your phone via Telegram, executes Python scripts and shell commands, streams output in real time, and proactively notifies you of events.
+KIRA is a local-first personal AI agent for Windows with Telegram control, optional always-on local voice, system awareness, proactive notifications, and a guarded complex-task runtime.
+
+It is designed for real day-to-day operator workflows: launching automations, checking system state, running monitored jobs, handling reminders/schedules, and escalating only when action approval is needed.
+
+## What KIRA Can Do
+
+- Control scripts and shell workflows safely from Telegram.
+- Run and monitor jobs with pause/resume/cancel lifecycle controls.
+- Route requests between deterministic commands and complex AI analysis.
+- Handle local voice triggers (hotkey, wake-word, enter-to-talk).
+- Provide proactive updates from observer and world context loops.
+- Maintain conversation and run history in a local DB.
+- Gate risky actions with explicit confirmation callbacks.
+
+## Runtime Surfaces
+
+- `python -m bot.main`: Telegram + background services + overlay runtime.
+- `python -m bot.local_voice`: standalone local voice runtime.
+- `python -m mcp.server`: local MCP endpoint for IDE/tool integrations.
+
+## Docs Map
+
+Detailed architecture and subsystem docs live in [`docs/README.md`](./docs/README.md):
+
+- [`docs/architecture.md`](./docs/architecture.md)
+- [`docs/providers-and-env.md`](./docs/providers-and-env.md)
+- [`docs/telegram-and-voice.md`](./docs/telegram-and-voice.md)
+- [`docs/complex-runtime.md`](./docs/complex-runtime.md)
+- [`docs/operations.md`](./docs/operations.md)
+- [`docs/testing.md`](./docs/testing.md)
 
 ## Quick Start
 
@@ -11,138 +40,150 @@ cd kira
 pip install -r requirements.txt
 ```
 
+Complex-task execution also uses `astra_node` in this repo setup. Install it in your environment if you use `/ask` complex flows:
+
+```bash
+pip install -e d:/AI_tools/astra/packages/astra-node
+```
+
 ### 2. Configure `.env`
 
-Edit `.env` with your actual values:
+Minimum setup:
 
 ```env
-BOT_TOKEN=your_telegram_bot_token_here
+BOT_TOKEN=your_telegram_bot_token
 ALLOWED_USER_IDS=123456789
 CHAT_ID=123456789
+OPENAI_API_KEY=your_openai_key
 LOG_LEVEL=INFO
 DEFAULT_TIMEOUT=30
-MCP_PORT=8000
 ```
 
-- **BOT_TOKEN** — Get from [@BotFather](https://t.me/BotFather)
-- **ALLOWED_USER_IDS** — Comma-separated Telegram user IDs. Get yours from [@userinfobot](https://t.me/userinfobot)
-- **CHAT_ID** — Your personal chat ID (same as your user ID for private chats)
+Provider overrides:
 
-### 3. Configure scripts
+- Chat: `KIRA_API_KEY`, `KIRA_API_BASE_URL`, `KIRA_FAST_MODEL`, `KIRA_SMART_MODEL`
+- Vision: `KIRA_VISION_API_KEY`, `KIRA_VISION_BASE_URL`, `KIRA_VISION_MODEL`
+- STT: `KIRA_STT_API_KEY`, `KIRA_STT_BASE_URL`, `KIRA_VOICE_TRANSCRIBE_MODEL`
+- TTS: `KIRA_TTS_API_KEY`, `KIRA_TTS_BASE_URL`, `KIRA_TTS_MODEL`, `KIRA_VOICE`
 
-Edit `config/scripts.toml` to register your scripts:
+### 3. Configure scripts and apps
 
-```toml
-[my_script]
-interpreter = "C:/path/to/venv/Scripts/python.exe"
-path        = "C:/path/to/script.py"
-args        = []
-timeout     = 300
-chain       = []
-```
+- `config/scripts.toml` for `/run`, `/chain`, and scheduler aliases.
+- `config/apps.toml` for app launch/close mappings and mode behavior.
 
-Optional fields:
-- `chain` — List of aliases to run sequentially on success
-- `checkpoint_interval` — For SB3 training: send summaries every N timesteps
-
-### 4. Run the bot
+### 4. Start KIRA
 
 ```bash
 python -m bot.main
 ```
 
-### 5. (Optional) Register as Windows startup tasks
-
-Right-click `autostart/setup_task_scheduler.ps1` → **Run with PowerShell as Administrator**.
-
-For Kira Local Voice, right-click `autostart/setup_local_voice_task.ps1` -> **Run with PowerShell**.
-This starts local voice after you log in, because global hotkeys, microphone, and speakers need your desktop session.
-
-### 6. (Optional) Start MCP server for Windsurf
-
-```bash
-uvicorn mcp.server:app --host 127.0.0.1 --port 8000
-```
-
-## Commands
-
-| Command | Description |
-|---|---|
-| `/run <alias> [args]` | Run a registered script |
-| `/shell <command>` | Run shell command (confirms destructive ops) |
-| `/chain <alias>` | Run script + chained scripts |
-| `/status` | List running processes |
-| `/kill <pid>` | Kill a process |
-| `/schedule <alias> <HH:MM\|Xm\|Xh>` | Schedule a run |
-| `/schedules` | List pending schedules |
-| `/unschedule <id>` | Cancel a schedule |
-| `/sysinfo` | CPU, RAM, GPU, disk info |
-| `/getfile <path>` | Download a file |
-| `/putfile` | Upload a file (reply to attachment) |
-| `/ls [path]` | List directory |
-| `/find <pattern> [path]` | Find files |
-| `/tail <path> [n]` | Tail a file |
-| `/mkdir <path>` | Create directory |
-| `/move <src> <dst>` | Move file/directory |
-| `/copy <text>` | Set clipboard |
-| `/paste` | Get clipboard |
-| `/screenshot [n]` | Take screenshot |
-| `/sleep` | Sleep PC |
-| `/shutdown <min>` | Schedule shutdown |
-| `/reboot <min>` | Schedule reboot |
-| `/abort_shutdown` | Cancel shutdown/reboot |
-| `/watch pid <pid>` | Alert when process dies |
-| `/watch file <path>` | Alert when file changes |
-| `/watches` | List active watchers |
-| `/unwatch <id>` | Remove watcher |
-| `/remind <Xm\|Xh> <msg>` | Set a reminder |
-| `/help` | Show all commands |
-
-## Local PC Voice
-
-Kira can also run as a local push-to-talk voice process, separate from the
-Telegram bot:
+Optional local voice:
 
 ```bash
 python -m bot.local_voice
 ```
 
-By default, press `Ctrl+Alt+K`, speak for the configured recording window, and Kira will
-transcribe the audio, execute safe local app/mode commands, and speak back
-through the PC speakers. Configure known apps and modes in
-`config/apps.toml`.
+## Command Surface (Telegram)
 
-Useful environment overrides:
+### Execution and process control
 
-```env
-KIRA_LOCAL_VOICE_RECORD_SECONDS=5
-KIRA_LOCAL_VOICE_SAMPLE_RATE=16000
-KIRA_LOCAL_VOICE_TRIGGER=hotkey
-KIRA_LOCAL_VOICE_HOTKEY=ctrl+alt+k
-```
+- `/run <alias> [args...]`
+- `/shell <command>`
+- `/chain <alias>`
+- `/status`
+- `/kill <pid>`
+- `/sysinfo`
 
-Set `KIRA_LOCAL_VOICE_TRIGGER=enter` to use the terminal Enter prompt instead
-of a global hotkey.
+### Scheduling and monitoring
 
-## Architecture
+- `/schedule <alias> <HH:MM|Xm|Xh>`
+- `/schedules`
+- `/unschedule <id>`
+- `/watch pid <pid>`
+- `/watch file <path>`
+- `/watches`
+- `/unwatch <id>`
+- `/remind <Xm|Xh> <message>`
 
-- **Long polling** — no public URL needed, works from anywhere
-- **asyncio throughout** — executor, scheduler, watchdog, reminders all concurrent
-- **notifier.py** — single outbound channel for all proactive messages
-- **training_parser.py** — SB3 checkpoint detection, only active when configured
-- **process_registry** — in-memory only, honest model for subprocess tracking
+### Files and desktop helpers
 
-## Important Notes
+- `/getfile <path>`
+- `/putfile [path]`
+- `/cd [path]`
+- `/ls [path]`
+- `/find <pattern> [path]`
+- `/tail <path> [n]`
+- `/mkdir <path>`
+- `/move <src> <dst>`
+- `/copy <text>`
+- `/paste`
+- `/screenshot [monitor]`
 
-- Schedules and watchdog tasks are **in-memory only** — they do not survive a bot restart.
-- Power settings: Set **Never sleep** (when plugged in) in Windows Power Options. Screen off is fine.
-- If `BOT_TOKEN` is ever leaked: BotFather → `/revoke` → update `.env` immediately.
+### App and power operations
 
-## Security
+- `/list_apps`
+- `/open <app>`
+- `/close_apps <app1> [app2]`
+- `/sleep`
+- `/shutdown <minutes>`
+- `/reboot <minutes>`
+- `/abort_shutdown`
 
-- Every handler requires user ID whitelist — no exceptions
-- Unknown users get silent ignore (bot existence not revealed)
-- `.env` is gitignored — secrets never committed
-- `/shell` confirms destructive commands before executing
-- Power commands require inline confirmation
-- MCP server binds to 127.0.0.1 only
+### Brain, memory, and jobs
+
+- `/ask <request>`
+- `/tasks [n]`
+- `/task <task_id>`
+- `/history [n]`
+- `/runs [alias] [n]`
+- `/summarise`
+- `/reflect`
+- `/recall <query>`
+- `/jobs`
+- `/canceljob <job_id>`
+- `/pausejob <job_id>`
+- `/resumejob <job_id>`
+- `/mode`
+- `/help`
+
+## Module Layout (Current)
+
+- `bot/main.py`: runtime startup, PTB wiring, callback routing.
+- `bot/handlers.py`: coordinator for `/ask`, callbacks, and voice-message flow.
+- `bot/cmd_fs.py`: filesystem commands.
+- `bot/cmd_process.py`: execution and power/process commands.
+- `bot/cmd_schedule.py`: schedules/watch/reminders.
+- `bot/cmd_jobs.py`: brain, memory, history, and job commands.
+- `bot/cmd_app.py`: app-control commands.
+- `bot/voice_confirm.py`: voice confirmation registry + TTS helper path.
+- `bot/brain.py`: complex runtime orchestration and approval semantics.
+- `bot/provider.py`: chat/STT/TTS/vision provider resolution.
+- `mcp/server.py`: localhost MCP service.
+
+## Safety Model
+
+- Telegram commands are auth-gated by allowed user IDs.
+- Unknown users are ignored.
+- Destructive shell patterns require explicit confirmation.
+- Power actions require explicit confirmation.
+- Complex runtime actions can require approval callbacks.
+- Local MCP endpoint binds to `127.0.0.1`.
+
+## Current Known Gaps
+
+- `requirements.txt` does not fully express optional runtime extras (notably Astra path in this setup).
+- `local_voice.py` and `brain.py` are high-capability modules with ongoing decomposition opportunities.
+- Production-hardening is stronger in operator workflow than in fresh-machine reproducibility.
+
+## Contributing
+
+1. Create a feature branch from `main`.
+2. Keep command-family logic inside `cmd_*` modules.
+3. Update docs in `docs/` when behavior changes.
+4. Run tests locally before opening a PR.
+
+## Security Notes
+
+- Never commit secrets or `.env`.
+- Rotate keys immediately if exposed in logs/screenshots.
+- Keep provider keys scoped per capability when possible.

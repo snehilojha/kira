@@ -692,7 +692,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 conversation_id="voice",
             )
             await msg.reply_text("Working on a deeper read-only analysis...")
-            result = await _run_complex_task_with_progress(msg.reply_text, task_request)
+
+            async def _voice_narrate(text: str) -> None:
+                audio = await voice_confirm._safe_synthesise(text)
+                if audio:
+                    await voice_confirm._send_voice(msg, audio)
+
+            result = await _run_complex_task_with_progress(
+                msg.reply_text,
+                task_request,
+                speak_fn=_voice_narrate,
+            )
             await msg.reply_text(result.summary[:4000])
             audio = await voice_confirm._safe_synthesise(result.summary[:2000])
             if audio:

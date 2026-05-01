@@ -20,6 +20,7 @@ import re
 import threading
 import wave
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -54,6 +55,9 @@ ConfirmCallback = Callable[[str], Awaitable[bool]]
 # Rolling history of the last 5 voice commands (transcript, result message)
 _command_history: collections.deque[tuple[str, str]] = collections.deque(maxlen=5)
 
+# Timestamp of the most recent voice command — read by proactive.py to detect silence
+_last_voice_activity: datetime | None = None
+
 # Persistent in-session conversation history for LLM context (max 16 messages = 8 turns)
 _session_history: list[dict] = []
 _SESSION_HISTORY_MAX = 16
@@ -61,6 +65,11 @@ _SESSION_HISTORY_MAX = 16
 # HWND of the window that was in focus just before Kira started listening.
 # Restored before desktop control actions so keystrokes/scroll hit the right app.
 _last_user_hwnd: int = 0
+
+
+def get_last_voice_activity() -> "datetime | None":
+    """Return the timestamp of the most recent voice command (for proactive tracking)."""
+    return _last_voice_activity
 
 
 def clear_session_history() -> None:
@@ -592,6 +601,48 @@ async def _log(transcript: str, result: str, intent: str) -> None:
         pass
 
 
+# Prefixes that mark a query as informational — skip desktop-action routing entirely.
+_QUESTION_PREFIXES = (
+    "how", "what", "why", "when", "who", "where", "which",
+    "tell me", "explain", "is ", "are ", "was ", "were ", "do ", "does ",
+    "did ", "can ", "could ", "would ", "should ", "has ", "have ",
+)
+
+
+def _is_desktop_action_candidate(text: str) -> bool:
+    """Return True only for requests that plausibly require clicking/typing on screen.
+
+    Informational questions (how, what, why, tell me…) always go to brain.
+    Action verbs without an explicit UI target also go to brain.
+    """
+    normalized = _normalize_text(text)
+    if any(normalized.startswith(p) for p in _QUESTION_PREFIXES):
+        return False
+    # Explicit action verbs that imply UI manipulation
+    _ACTION_VERBS = (
+        "click", "press", "scroll", "drag", "select", "highlight",
+        "copy", "paste", "close", "minimize", "maximize", "resize",
+        "move the", "switch to", "go to", "navigate to", "open ",
+        "type ", "fill in", "submit", "right-click",
+    )
+    return any(normalized.startswith(v) or f" {v}" in normalized for v in _ACTION_VERBS)
+
+
+_CORRECTION_PHRASES = (
+    "that's wrong", "thats wrong", "that is wrong",
+    "not what i meant", "not what i said",
+    "ignore that", "forget that", "never mind",
+    "that's not right", "thats not right", "that is not right",
+    "wrong answer", "incorrect", "you misunderstood",
+    "that's incorrect", "thats incorrect",
+)
+
+
+def _is_correction(text: str) -> bool:
+    normalized = _normalize_text(text)
+    return any(phrase in normalized for phrase in _CORRECTION_PHRASES)
+
+
 async def handle_transcript(
     transcript: str,
     *,
@@ -599,6 +650,13 @@ async def handle_transcript(
     config: app_control.AppsConfig | None = None,
 ) -> tuple[ParsedCommand | None, LocalVoiceResult]:
     """Parse and execute one transcript."""
+    global _last_voice_activity
+    _last_voice_activity = datetime.now()
+
+    # Correction detection — log before processing so the reflector sees the signal
+    if _is_correction(transcript) and _command_history:
+        await _log(transcript, "correction detected", "correction")
+
     # Memory / identity commands are intercepted before anything else.
     memory_reply = identity.extract_memory_from_transcript(transcript)
     if memory_reply:
@@ -637,6 +695,16 @@ async def handle_transcript(
         _command_history.append((transcript, result.message[:80]))
         await _log(transcript, result.message, "desktop")
         return parsed, result
+
+    # Informational questions go straight to brain — the desktop action LLM
+    # routinely misclassifies "how's my PNL", "what's the weather" etc. as
+    # UI actions when the relevant app happens to be visible on screen.
+    if not _is_desktop_action_candidate(transcript):
+        result = await _handle_with_brain(transcript)
+        _command_history.append((transcript, result.message[:80]))
+        _append_session_history(transcript, result.spoken)
+        await _log(transcript, result.spoken, "brain")
+        return None, result
 
     # For everything else: vision-based desktop action first (LLM sees screen,
     # uses real coordinates). Falls through to brain for non-UI requests.

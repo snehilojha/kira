@@ -207,7 +207,7 @@ async def build_execution_context(
         config={
             "provider": "openai-compatible",
             "model_role": "smart",
-            "max_turns": 6,
+            "max_turns": 18,
             "cwd": str(_PROJECT_ROOT),
             "approval_timeout_seconds": 60,
         },
@@ -315,6 +315,15 @@ async def run_complex_task_stream(
 
     text_parts: list[str] = []
     tool_events: list[dict[str, Any]] = []
+    _tool_call_count = 0
+    _NARRATION_EVERY = 3
+    _NARRATION_LINES = [
+        "Still working on it.",
+        "Still on it — making progress.",
+        "Hang tight, almost there.",
+        "Still working — pulling it together now.",
+        "One more moment.",
+    ]
 
     _persist_task_state(
         task_request,
@@ -354,6 +363,17 @@ async def run_complex_task_stream(
         if isinstance(event, TextDelta):
             text_parts.append(event.text)
         elif isinstance(event, ToolStart):
+            _tool_call_count += 1
+            if _tool_call_count % _NARRATION_EVERY == 0:
+                narration = _NARRATION_LINES[
+                    (_tool_call_count // _NARRATION_EVERY - 1) % len(_NARRATION_LINES)
+                ]
+                yield BrainEvent(
+                    task_id=task_request.task_id,
+                    event_type="narration",
+                    message=narration,
+                    stage=TaskStage.TOOL_RUNNING,
+                )
             tool_msg = _describe_tool_start(event.tool_name, event.tool_input)
             tool_event = {
                 "type": event.type,

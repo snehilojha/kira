@@ -113,10 +113,13 @@ async def synthesise(text: str, response_format: str | None = None) -> tuple[byt
 
 def mp3_to_wav_bytes(mp3_bytes: bytes) -> bytes:
     """Decode mp3 bytes to WAV bytes using ffmpeg subprocess."""
+    import shutil
     import subprocess
-    import io as _io
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found on PATH — cannot convert MP3 to WAV")
     result = subprocess.run(
-        ["ffmpeg", "-y", "-f", "mp3", "-i", "pipe:0", "-f", "wav", "pipe:1"],
+        [ffmpeg, "-y", "-f", "mp3", "-i", "pipe:0", "-f", "wav", "pipe:1"],
         input=mp3_bytes,
         capture_output=True,
     )

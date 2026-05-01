@@ -169,6 +169,7 @@ async def _loop(speak_fn: SpeakFn) -> None:
         if message:
             logger.info("Proactive speaking: %r", message)
             _last_spoken = datetime.now()
+            spoken_at = _last_spoken
             try:
                 from bot import overlay as _overlay
                 _overlay.set_state("speaking")
@@ -180,6 +181,26 @@ async def _loop(speak_fn: SpeakFn) -> None:
                 _overlay.set_state("idle")
             except Exception:
                 pass
+            # Check after 5 min whether the user responded — if not, log as ignored
+            asyncio.ensure_future(_check_ignored(message, spoken_at))
+
+
+async def _check_ignored(message: str, spoken_at: datetime) -> None:
+    """After 5 min, log the proactive message as ignored if no voice followed."""
+    await asyncio.sleep(5 * 60)
+    try:
+        from bot import local_voice as _lv
+        from bot import db as _db
+        last_activity = _lv.get_last_voice_activity()
+        if last_activity is None or last_activity <= spoken_at:
+            await _db.log_voice_command(
+                transcript=f"[proactive] {message[:200]}",
+                result="no response within 5 minutes",
+                intent="proactive_ignored",
+            )
+            logger.debug("Proactive message logged as ignored: %r", message[:80])
+    except Exception as exc:
+        logger.debug("_check_ignored failed: %s", exc)
 
 
 def start(speak_fn: SpeakFn) -> None:

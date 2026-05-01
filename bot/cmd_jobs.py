@@ -452,8 +452,19 @@ async def handle_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # ── Brain approval helpers ────────────────────────────────────────
 
-async def run_complex_task_with_progress(reply, task_request) -> brain.BrainResult:
-    """Run a complex task and stream meaningful progress updates to chat."""
+async def run_complex_task_with_progress(
+    reply,
+    task_request,
+    speak_fn=None,
+) -> brain.BrainResult:
+    """Run a complex task and stream meaningful progress updates to chat.
+
+    Args:
+        reply: Async callable for sending text (Telegram reply or similar).
+        task_request: The task to execute.
+        speak_fn: Optional async callable for TTS narration on the voice path.
+            When provided, narration events are spoken aloud instead of sent as text.
+    """
     final_result: brain.BrainResult | None = None
 
     async def _approval_callback(request: approval.ApprovalRequest) -> bool:
@@ -465,6 +476,12 @@ async def run_complex_task_with_progress(reply, task_request) -> brain.BrainResu
     ):
         if event.result is not None:
             final_result = event.result
+            continue
+        if event.event_type == "narration" and speak_fn is not None:
+            try:
+                await speak_fn(event.message)
+            except Exception:
+                pass
             continue
         if event.event_type in {"status", "tool", "warning"}:
             await reply(event.message[:4000])
