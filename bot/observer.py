@@ -26,7 +26,7 @@ import subprocess
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from bot import provider
 
@@ -58,6 +58,23 @@ _LOW_CPU_STDIN_DURATION = int(os.environ.get("KIRA_STDIN_DETECT_SECONDS", "120")
 # Cleared when the user returns. Read by mode.py for the return summary.
 _absence_log: list[str] = []
 
+# Maps Telegram message_id → alert description so handle_text can attach
+# context when the user replies to an escalation message.
+_escalation_context: dict[int, str] = {}
+_ESCALATION_CONTEXT_MAX = 20
+
+
+def get_escalation_context(message_id: int) -> str | None:
+    """Return the alert description for a Telegram message_id, or None."""
+    return _escalation_context.get(message_id)
+
+
+def _store_escalation_context(message_id: int, description: str) -> None:
+    if len(_escalation_context) >= _ESCALATION_CONTEXT_MAX:
+        oldest = next(iter(_escalation_context))
+        del _escalation_context[oldest]
+    _escalation_context[message_id] = description
+
 
 def get_absence_log() -> list[str]:
     """Return escalation events that fired during the current autonomous period."""
@@ -81,11 +98,26 @@ _project_context_cache: dict[str, str] = {}
 # Last window title we parsed — avoid recomputing on every brain call
 _last_foreground_title: str = ""
 _active_project_context: str = ""
+_last_active_folder: str = ""
+
+# Optional callback fired when the user switches to a different project.
+# Signature: (project_summary: str) -> None  (sync, called via ensure_future)
+_project_switch_callback: "Callable[[str], Any] | None" = None
 
 
 def get_active_project_context() -> str:
     """Return the pre-emptive context for the project currently in focus."""
     return _active_project_context
+
+
+def register_project_switch_callback(fn: "Callable[[str], Any]") -> None:
+    """Register a callback invoked when the active project changes.
+
+    ``fn`` receives the project summary string. It may be a coroutine function;
+    if so it is scheduled with ``asyncio.ensure_future``.
+    """
+    global _project_switch_callback
+    _project_switch_callback = fn
 
 
 def get_pending_triggers() -> list[str]:
@@ -191,9 +223,11 @@ async def _run_fast_cycle() -> None:
             png = await asyncio.to_thread(_get_screenshot_bytes)
             caption = f"Kira: {message}"
             if png:
-                await notifier.send_photo(caption, png)
+                msg_id = await notifier.send_photo(caption, png)
             else:
-                await notifier.send(caption)
+                msg_id = await notifier.send(caption)
+            if msg_id:
+                _store_escalation_context(msg_id, message)
         except Exception as exc:
             logger.warning("Escalation notify failed: %s", exc)
 
@@ -836,7 +870,7 @@ def _build_project_summary(folder: Path) -> str:
 
 async def _refresh_active_project_context(title: str) -> None:
     """Detect active project from window title and update the context cache."""
-    global _last_foreground_title, _active_project_context
+    global _last_foreground_title, _active_project_context, _last_active_folder
 
     if title == _last_foreground_title:
         return
@@ -848,14 +882,25 @@ async def _refresh_active_project_context(title: str) -> None:
         return
 
     folder_key = str(folder)
+    is_new_project = folder_key != _last_active_folder
+
     if folder_key in _project_context_cache:
         _active_project_context = _project_context_cache[folder_key]
-        return
+    else:
+        summary = await asyncio.to_thread(_build_project_summary, folder)
+        _project_context_cache[folder_key] = summary
+        _active_project_context = summary
+        logger.info("Active project context loaded: %s", folder.name)
 
-    summary = await asyncio.to_thread(_build_project_summary, folder)
-    _project_context_cache[folder_key] = summary
-    _active_project_context = summary
-    logger.info("Active project context loaded: %s", folder.name)
+    if is_new_project:
+        _last_active_folder = folder_key
+        if _project_switch_callback is not None:
+            try:
+                result = _project_switch_callback(_active_project_context)
+                if asyncio.iscoroutine(result):
+                    asyncio.ensure_future(result)
+            except Exception as exc:
+                logger.debug("Project switch callback failed: %s", exc)
 
 
 # ── Proactive notification ────────────────────────────────────────

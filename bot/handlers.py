@@ -27,6 +27,7 @@ from bot import cmd_jobs
 from bot import cmd_process
 from bot import cmd_schedule
 from bot import db
+from bot import observer
 from bot import process_registry
 from bot import provider
 from bot import router
@@ -265,8 +266,6 @@ async def _build_ask_system_prompt() -> str:
 
     observer_context = ""
     try:
-        from bot import observer
-
         observer_context = observer.get_current_context()
     except Exception:
         pass
@@ -276,6 +275,28 @@ async def _build_ask_system_prompt() -> str:
         from bot import memory
 
         session_context = await memory.get_recent_sessions(3)
+    except Exception:
+        pass
+
+    world_context = ""
+    try:
+        snap = await db.get_recent_world_snapshot()
+        if snap:
+            import json as _json
+            from datetime import datetime as _dt
+            parts = [f"Time: {_dt.now().strftime('%A, %d %B %Y, %H:%M')}"]
+            if snap.get("weather"):
+                parts.append(f"Weather: {snap['weather']}")
+            if snap.get("top_news"):
+                parts.append(f"News:\n{snap['top_news']}")
+            if snap.get("stocks"):
+                stocks = snap["stocks"]
+                if isinstance(stocks, str):
+                    stocks = _json.loads(stocks)
+                indices = stocks.get("indices", {})
+                if indices:
+                    parts.append("Markets: " + ", ".join(f"{k}: {v}" for k, v in indices.items()))
+            world_context = "\n".join(parts)
     except Exception:
         pass
 
@@ -314,6 +335,8 @@ async def _build_ask_system_prompt() -> str:
         live_context,
     ]
 
+    if world_context:
+        sections.extend(["", "World context:", world_context])
     if observer_context:
         sections.extend(["", "Machine awareness (auto-updated every 15 min):", observer_context])
     if session_context:
@@ -611,6 +634,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_message = (update.message.text or "").strip()
     if not user_message:
         return
+
+    # If this is a reply to an escalation alert, prepend the alert context.
+    reply_to = update.message.reply_to_message
+    if reply_to:
+        try:
+            alert_ctx = observer.get_escalation_context(reply_to.message_id)
+            if alert_ctx:
+                user_message = f"[Replying to alert: {alert_ctx}]\n{user_message}"
+        except Exception:
+            pass
 
     try:
         await db.log_conversation("user", user_message)

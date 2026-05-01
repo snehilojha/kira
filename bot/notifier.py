@@ -105,7 +105,7 @@ async def send_photo(caption: str, png_bytes: bytes) -> int | None:
         return None
 
 
-async def send(message: str, parse_mode: str | None = None) -> bool:
+async def send(message: str, parse_mode: str | None = None) -> int | None:
     """Send a Telegram message to CHAT_ID.
 
     Args:
@@ -113,11 +113,11 @@ async def send(message: str, parse_mode: str | None = None) -> bool:
         parse_mode: Optional Telegram parse mode (e.g. "HTML", "Markdown").
 
     Returns:
-        True if the message was sent successfully, False otherwise.
+        The Telegram message_id on success, None on failure.
     """
     if not _BOT_TOKEN or not _CHAT_ID:
         logger.error("notifier not initialised — call notifier.init() first")
-        return False
+        return None
 
     text = message[:_MAX_MESSAGE_LENGTH]
     payload: dict = {"chat_id": _CHAT_ID, "text": text}
@@ -130,8 +130,8 @@ async def send(message: str, parse_mode: str | None = None) -> bool:
             resp = await client.post(url, json=payload, timeout=15)
             if resp.status_code != 200:
                 logger.error("Telegram API error %s: %s", resp.status_code, resp.text)
-                return False
-            return True
+                return None
+            return resp.json().get("result", {}).get("message_id")
     except httpx.HTTPError as exc:
         logger.error("Failed to send Telegram message: %s", exc)
-        return False
+        return None

@@ -1342,6 +1342,39 @@ def _web_search(query: str) -> str:
     return "\n\n".join(lines)
 
 
+def _register_project_switch_hook(speak_fn) -> None:
+    """Register a callback with observer that speaks a nudge on project switch."""
+    from bot import observer as _observer
+
+    async def _on_switch(project_summary: str) -> None:
+        try:
+            response = await provider.create_chat_completion(
+                role="fast",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Kira, a personal AI assistant. "
+                            "The user just switched to a project in their editor. "
+                            "Given the project summary, say ONE short sentence surfacing the most useful context — "
+                            "last commit, active branch, recently changed files, or an open note. "
+                            "Be specific, not generic. No greeting. No markdown. Spoken aloud via TTS."
+                        ),
+                    },
+                    {"role": "user", "content": project_summary},
+                ],
+                max_tokens=60,
+                temperature=0.3,
+            )
+            line = (response.choices[0].message.content or "").strip()
+            if line:
+                await speak_fn(line)
+        except Exception as exc:
+            logger.debug("Project switch nudge failed: %s", exc)
+
+    _observer.register_project_switch_callback(_on_switch)
+
+
 async def run_capture_once(
     *,
     record_seconds: float = _DEFAULT_RECORD_SECONDS,
@@ -1395,11 +1428,23 @@ async def run_capture_once(
 
     # ── Full mode voice triggers ───────────────────────────────
     _lower = transcript.strip().lower()
-    if any(p in _lower for p in ("take over", "activate full", "full mode")):
+    if any(p in _lower for p in ("take over", "takeover", "activate full", "full mode")):
         _ui_mode.activate("voice command")
+        spoken = "Full mode activated."
+        overlay.set_transcript(transcript, spoken)
+        overlay.set_state("speaking")
+        await speak(spoken)
+        overlay.set_state("idle")
+        return LocalVoiceResult(ok=True, message="Full mode activated.", spoken=spoken)
     elif any(p in _lower for p in ("stand down", "deactivate", "exit full", "compact mode")):
         _ui_mode.deactivate("voice command")
         clear_session_history()
+        spoken = "Standing down."
+        overlay.set_transcript(transcript, spoken)
+        overlay.set_state("speaking")
+        await speak(spoken)
+        overlay.set_state("idle")
+        return LocalVoiceResult(ok=True, message="Compact mode restored.", spoken=spoken)
 
     overlay.set_transcript(transcript, "")
 
@@ -1606,6 +1651,7 @@ async def run_loop() -> None:
     from bot import ambient as _ambient
     _ambient.start()
     _proactive.start(speak)
+    _register_project_switch_hook(speak)
 
     if trigger == "enter":
         await _run_enter_loop(record_seconds=record_seconds, sample_rate=sample_rate, config=config)
@@ -1780,6 +1826,7 @@ async def start_as_task() -> None:
     from bot import ambient as _ambient
     _ambient.start()
     _proactive.start(speak)
+    _register_project_switch_hook(speak)
 
     try:
         if trigger == "enter":
