@@ -113,6 +113,7 @@ class OrbRenderer(QWidget):
         self._tint          = _time_of_day_tint()
         self._tint_tick     = 0     # refresh tint every ~30 s
         self._micro_ticks   = 0     # countdown for transient micro-states
+        self._cpu_pressure  = 0.0   # [0,1] — updated every 3 s from system stats
 
         # Fibonacci sphere — fixed unit vectors (Nx3)
         golden = math.pi * (3 - math.sqrt(5))
@@ -147,6 +148,10 @@ class OrbRenderer(QWidget):
         """Push a live audio amplitude value [0,1]. Called ~20x/sec during TTS."""
         self._amplitude = max(0.0, min(1.0, v))
 
+    def set_system_pressure(self, cpu: float) -> None:
+        """Inform orb of current CPU load [0-100]. Shifts color and energy in idle."""
+        self._cpu_pressure = max(0.0, min(1.0, cpu / 100.0))
+
     # ── Internal ──────────────────────────────────────────────────
 
     def _tick(self) -> None:
@@ -162,7 +167,9 @@ class OrbRenderer(QWidget):
         elif self._state in ("idle", "hot"):
             # Breathing: slow sine wave so idle/hot never looks frozen
             breathe = math.sin(self._t * (2 * math.pi / (self.FPS * _BREATHE_PERIOD)))
-            target = self._target_energy + breathe * _BREATHE_AMP
+            # CPU pressure lifts energy and speeds up breathing slightly
+            pressure_lift = self._cpu_pressure * 0.18
+            target = self._target_energy + breathe * _BREATHE_AMP + pressure_lift
         elif self._state == "satisfied":
             # Warm double-pulse: quick rise then settle
             phase = 1.0 - (self._micro_ticks / (self.FPS * 1.5))

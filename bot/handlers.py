@@ -541,6 +541,24 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("❌ Cancelled.")
         return
 
+    if data.startswith("presence_allow_"):
+        token = data[len("presence_allow_"):]
+        from bot import presence as _presence
+        future = _presence._PENDING.pop(token, None)
+        if future and not future.done():
+            future.set_result("allow")
+        await query.edit_message_text("✅ Access allowed.")
+        return
+
+    if data.startswith("presence_lock_"):
+        token = data[len("presence_lock_"):]
+        from bot import presence as _presence
+        future = _presence._PENDING.pop(token, None)
+        if future and not future.done():
+            future.set_result("lock")
+        await query.edit_message_text("🔒 System locked.")
+        return
+
 
 @require_auth
 async def handle_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

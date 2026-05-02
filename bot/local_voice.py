@@ -1503,6 +1503,20 @@ async def run_capture_once(
         return result
     print(f"Heard: {transcript}")
 
+    # ── Presence: any voice = activity; check for wake phrase ─
+    try:
+        from bot import presence as _presence
+        _presence.on_activity()
+        if "kira wake up" in transcript.strip().lower():
+            _presence.on_wake_phrase()
+            overlay.set_state("idle")
+            return LocalVoiceResult(ok=True, message="Presence wake phrase detected.", spoken="")
+        if _presence.is_locked():
+            overlay.set_state("idle")
+            return LocalVoiceResult(ok=True, message="System locked — ignoring command.", spoken="")
+    except ImportError:
+        pass
+
     # ── Kira filter (stay-hot compact mode) ───────────────────
     if kira_filter and "kira" not in transcript.strip().lower():
         overlay.set_state("idle")

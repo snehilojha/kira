@@ -78,6 +78,37 @@ async def confirm_via_telegram(command_preview: str) -> bool:
         return False
 
 
+async def send_photo_with_buttons(
+    caption: str, png_bytes: bytes, keyboard: list
+) -> int | None:
+    """Send a photo with an inline keyboard. Returns message_id or None."""
+    if not _BOT_TOKEN or not _CHAT_ID:
+        logger.error("notifier not initialised — call notifier.init() first")
+        return None
+
+    url = f"https://api.telegram.org/bot{_BOT_TOKEN}/sendPhoto"
+    import json as _json
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                url,
+                data={
+                    "chat_id": _CHAT_ID,
+                    "caption": caption[:1024],
+                    "reply_markup": _json.dumps({"inline_keyboard": keyboard}),
+                },
+                files={"photo": ("photo.png", png_bytes, "image/png")},
+                timeout=20,
+            )
+            if resp.status_code != 200:
+                logger.error("Telegram sendPhoto+buttons error %s: %s", resp.status_code, resp.text)
+                return None
+            return resp.json().get("result", {}).get("message_id")
+    except httpx.HTTPError as exc:
+        logger.error("Failed to send photo with buttons: %s", exc)
+        return None
+
+
 async def send_photo(caption: str, png_bytes: bytes) -> int | None:
     """Send a screenshot (PNG bytes) with a caption to CHAT_ID.
 

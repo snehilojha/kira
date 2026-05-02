@@ -203,13 +203,14 @@ class _LeftPanel(QWidget):
                 disk_str = "N/A"
 
             try:
-                import GPUtil as _GPUtil
-                gpus = _GPUtil.getGPUs()
-                if gpus:
-                    g = gpus[0]
-                    gpu_str = f"{g.load*100:.0f}%  {g.memoryUsed:.0f}/{g.memoryTotal:.0f} MB"
-                else:
-                    gpu_str = "N/A"
+                import subprocess as _sp
+                r = _sp.run(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                parts = [x.strip() for x in r.stdout.strip().split(",")]
+                gpu_str = f"{parts[0]}%  {parts[1]}/{parts[2]} MB"
             except Exception:
                 gpu_str = "N/A"
 
@@ -218,16 +219,30 @@ class _LeftPanel(QWidget):
                        if bat else "N/A")
 
             cpu_cores = psutil.cpu_count(logical=True) or 1
-            procs = sorted(
-                psutil.process_iter(["name", "cpu_percent"]),
-                key=lambda p: p.info.get("cpu_percent") or 0,
-                reverse=True,
-            )
-            hog_lines = []
-            for p in procs[:4]:
-                name = (p.info.get("name") or "?")[:18]
-                pct  = min((p.info.get("cpu_percent") or 0) / cpu_cores, 100.0)
-                hog_lines.append(f"{name:<18} {pct:>5.1f}%")
+            try:
+                # cpu_percent(interval=1) blocks 1 s but gives accurate per-process values
+                procs_raw = list(psutil.process_iter(["name", "pid"]))
+                for p in procs_raw:
+                    try:
+                        p.cpu_percent(interval=None)  # seed
+                    except Exception:
+                        pass
+                import time as _time
+                _time.sleep(1.0)
+                proc_data = []
+                for p in procs_raw:
+                    try:
+                        pct = p.cpu_percent(interval=None) / cpu_cores
+                        proc_data.append((p.info.get("name") or "?", pct))
+                    except Exception:
+                        pass
+                proc_data.sort(key=lambda x: x[1], reverse=True)
+                hog_lines = [
+                    f"{name[:18]:<18} {min(pct,100.0):>5.1f}%"
+                    for name, pct in proc_data[:4]
+                ]
+            except Exception:
+                hog_lines = []
 
             elapsed = int(time.monotonic() - self._start)
             up_str  = f"{elapsed//3600:02d}:{(elapsed%3600)//60:02d}:{elapsed%60:02d}"
@@ -239,6 +254,7 @@ class _LeftPanel(QWidget):
                     Qt.ConnectionType.QueuedConnection,
                     Q_ARG("PyQt_PyObject", {
                         "cpu": f"{cpu:.0f}%",
+                        "cpu_raw": cpu,
                         "ram": ram_str,
                         "disk": disk_str,
                         "gpu": gpu_str,
@@ -721,6 +737,7 @@ class _KiraOverlay(QWidget):
     @pyqtSlot("PyQt_PyObject")
     def _apply_sys_stats(self, d: dict) -> None:
         self._left.apply_sys_stats(d)
+        self._orb_full.set_system_pressure(d.get("cpu_raw", 0.0))
 
     @pyqtSlot()
     def _launch_webcam_preview(self) -> None:
@@ -772,10 +789,9 @@ class _KiraOverlay(QWidget):
         event.ignore()
 
     def paintEvent(self, event):
-        # Full mode: draw semi-dark background so panels are readable
         if self._full_mode:
             painter = QPainter(self)
-            painter.fillRect(self.rect(), QColor(0, 0, 0, 200))
+            painter.fillRect(self.rect(), QColor(8, 6, 15, 245))
             painter.end()
 
 

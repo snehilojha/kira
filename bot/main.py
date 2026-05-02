@@ -32,6 +32,7 @@ from bot import scheduler
 from bot import task_state
 from bot import watchdog
 from bot import world
+from bot import presence
 from bot import reflector
 from bot.auth import load_allowed_users
 
@@ -130,6 +131,7 @@ def _build_ptb_app(token: str):
         application.create_task(world.start())
         application.create_task(local_voice.start_as_task())
         application.create_task(reflector.start_weekly_reflector())
+        presence.start(local_voice.speak)
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
 
