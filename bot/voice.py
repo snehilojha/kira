@@ -15,12 +15,49 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from typing import AsyncIterator
 
 from bot import provider
+
+# PCM stream parameters (OpenAI pcm format)
+PCM_SAMPLE_RATE = 24_000
+PCM_CHANNELS    = 1
 
 logger = logging.getLogger(__name__)
 
 _EMOTION_TAG_RE = re.compile(r"<(?:laugh|chuckle|sigh|gasp|yawn|cough|sob)>", re.IGNORECASE)
+
+_ABBREV = {
+    "e.g.": "for example",
+    "i.e.": "that is",
+    "vs.":  "versus",
+    "vs":   "versus",
+    "etc.": "et cetera",
+    "approx.": "approximately",
+    "approx": "approximately",
+    "min.": "minutes",
+    "sec.": "seconds",
+    "ms":   "milliseconds",
+    "kb":   "kilobytes",
+    "mb":   "megabytes",
+    "gb":   "gigabytes",
+    "tb":   "terabytes",
+    "cpu":  "C P U",
+    "gpu":  "G P U",
+    "ram":  "R A M",
+    "api":  "A P I",
+    "url":  "U R L",
+    "cli":  "C L I",
+    "ui":   "U I",
+    "llm":  "L L M",
+    "ai":   "A I",
+    "ml":   "M L",
+}
+
+_ABBREV_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(k) for k in _ABBREV) + r')\b',
+    re.IGNORECASE,
+)
 
 
 def _supports_emotion_tags() -> bool:
@@ -35,9 +72,35 @@ def _tts_format() -> str:
     return "wav"
 
 
+def _format_for_speech(text: str) -> str:
+    """Convert LLM output to natural spoken form before sending to TTS."""
+    # Strip markdown formatting
+    text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)
+    text = re.sub(r'`{1,3}[^`]*`{1,3}', lambda m: m.group(0).strip('`'), text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r'^[-*•]\s+', '', text, flags=re.MULTILINE)
+
+    # Numbers and units
+    text = re.sub(r'(\d+(?:\.\d+)?)\s*%', lambda m: f"{m.group(1)} percent", text)
+    text = re.sub(r'\$(\d+(?:,\d{3})*(?:\.\d+)?)', lambda m: f"{m.group(1)} dollars", text)
+    text = re.sub(r'(\d+(?:\.\d+)?)\s*x\b', lambda m: f"{m.group(1)} times", text)
+
+    # Expand abbreviations
+    text = _ABBREV_RE.sub(lambda m: _ABBREV[m.group(0).lower()], text)
+
+    # Collapse excess whitespace / blank lines
+    text = re.sub(r'\n{2,}', '. ', text)
+    text = re.sub(r'\n', ' ', text)
+    text = re.sub(r'  +', ' ', text)
+
+    return text.strip()
+
+
 def _prepare_text(text: str) -> str:
     if _supports_emotion_tags():
         return text
+    text = _format_for_speech(text)
     return _EMOTION_TAG_RE.sub("", text).strip()
 
 
@@ -183,6 +246,41 @@ async def synthesise(text: str, response_format: str | None = None) -> tuple[byt
         except Exception as fallback_exc:
             logger.error("All TTS providers failed: %s", fallback_exc)
             raise primary_exc
+
+
+async def _stream_openai_pcm(text: str) -> AsyncIterator[bytes]:
+    """Stream raw PCM chunks from OpenAI TTS (24kHz, mono, int16)."""
+    from openai import AsyncOpenAI
+    client = AsyncOpenAI(
+        api_key=os.environ.get("OPENAI_API_KEY"),
+        base_url=os.environ.get("KIRA_TTS_BASE_URL") or None,
+    )
+    tts_model = os.environ.get("KIRA_TTS_MODEL", "gpt-4o-mini-tts")
+    instructions = os.environ.get("KIRA_TTS_INSTRUCTIONS")
+    kwargs: dict = dict(
+        model=tts_model,
+        voice=_get_voice_name(),
+        input=_prepare_text(text),
+        response_format="pcm",
+    )
+    if instructions and ("mini-tts" in tts_model or "4o" in tts_model):
+        kwargs["instructions"] = instructions
+
+    async with client.audio.speech.with_streaming_response.create(**kwargs) as response:
+        async for chunk in response.iter_bytes(chunk_size=4096):
+            if chunk:
+                yield chunk
+
+
+async def synthesise_stream(text: str) -> AsyncIterator[bytes]:
+    """Stream PCM audio chunks (24kHz, mono, int16). Falls back to full synthesis on error."""
+    try:
+        async for chunk in _stream_openai_pcm(text):
+            yield chunk
+    except Exception as exc:
+        logger.warning("OpenAI PCM stream failed (%s) — falling back to full synthesis", exc)
+        audio_bytes, _ = await _synthesise_openai_fallback(text)
+        yield audio_bytes
 
 
 def mp3_to_wav_bytes(mp3_bytes: bytes) -> bytes:

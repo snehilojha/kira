@@ -37,6 +37,7 @@ from bot import overlay
 from bot import provider
 from bot import screen_vision
 from bot import voice
+from bot import voice_playback
 from bot import wake_word as wake_word_mod
 
 logger = logging.getLogger(__name__)
@@ -70,21 +71,14 @@ _cue_wavs: list[bytes] = []
 async def _prerender_cues() -> None:
     global _cue_wavs
     try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
         rendered: list[bytes] = []
         for phrase in _CUE_PHRASES:
-            response = await client.audio.speech.create(
-                model="gpt-4o-mini-tts",
-                voice=voice._get_voice_name(),
-                input=phrase,
-                response_format="mp3",
-                instructions="Speak with alert, attentive readiness — like a sharp assistant snapping to attention. Crisp and present, not robotic.",
-            )
-            audio_bytes = response.read()
-            audio_bytes = await asyncio.to_thread(voice.mp3_to_wav_bytes, audio_bytes)
+            audio_bytes, fmt = await voice.synthesise(phrase)
+            if fmt != "wav":
+                audio_bytes = await asyncio.to_thread(voice.mp3_to_wav_bytes, audio_bytes)
             rendered.append(audio_bytes)
         _cue_wavs = rendered
+        logger.info("Pre-rendered %d activation cues", len(_cue_wavs))
     except Exception as exc:
         logger.warning("Could not pre-render acknowledgement cues: %s", exc)
 
@@ -93,9 +87,7 @@ async def _activation_cue() -> None:
     """Play a random acknowledgement cue + flash orb on wake word or hotkey."""
     overlay.set_state("listening")
     if _cue_wavs:
-        await asyncio.to_thread(play_wav_bytes, random.choice(_cue_wavs))
-    else:
-        await speak(random.choice(_CUE_PHRASES))
+        await asyncio.to_thread(voice_playback.play_wav_bytes, random.choice(_cue_wavs))
 
 # Persistent in-session conversation history for LLM context (max 16 messages = 8 turns)
 _session_history: list[dict] = []
@@ -1655,87 +1647,28 @@ def record_wav_bytes(
     return buffer.getvalue()
 
 
-def play_wav_bytes(audio_bytes: bytes) -> None:
-    """Play WAV bytes through the default output device.
-
-    Uses a sounddevice callback stream so audio runs on its own OS audio
-    thread — the calling thread never blocks on audio I/O.  A lightweight
-    daemon thread pushes RMS amplitude to the orb every 50 ms in parallel.
-    """
-    import numpy as np
-    import sounddevice as sd
-
-    with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
-        sample_rate = wav_file.getframerate()
-        channels    = wav_file.getnchannels()
-        sample_width = wav_file.getsampwidth()
-        frames      = wav_file.readframes(wav_file.getnframes())
-
-    if sample_width != 2:
-        raise ValueError(f"Unsupported WAV sample width: {sample_width}")
-
-    raw = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-    audio_f32 = raw.reshape(-1, channels)   # shape: (samples, channels)
-    mono      = raw.reshape(-1, channels).mean(axis=1)
-
-    _MAX_RMS      = 0.18        # normalised float RMS for typical speech
-    _AMP_INTERVAL = 0.05        # seconds between amplitude pushes (50 ms)
-    _amp_chunk    = int(sample_rate * _AMP_INTERVAL)
-
-    # Pre-compute per-chunk RMS so the amplitude thread is trivial
-    n_chunks = max(1, len(mono) // _amp_chunk)
-    amp_timeline = []
-    for i in range(n_chunks):
-        sl = mono[i * _amp_chunk : (i + 1) * _amp_chunk]
-        rms = float(np.sqrt(np.mean(sl ** 2))) if len(sl) else 0.0
-        amp_timeline.append(min(rms / _MAX_RMS, 1.0))
-
-    # Cursor shared between callback and the main thread (list = mutable reference)
-    cursor = [0]
-    done_event = threading.Event()
-
-    def _callback(outdata, frames, time_info, status):
-        start = cursor[0]
-        end   = start + frames
-        chunk = audio_f32[start:end]
-        if len(chunk) < frames:
-            # Pad the last block with silence and signal done
-            outdata[:len(chunk)] = chunk
-            outdata[len(chunk):] = 0
-            cursor[0] = len(audio_f32)
-            done_event.set()
-            raise sd.CallbackStop()
-        outdata[:] = chunk
-        cursor[0]  = end
-
-    # Amplitude pusher — runs on a daemon thread, never touches the audio stream
-    def _push_amplitudes():
-        for amp in amp_timeline:
-            overlay.push_amplitude(amp)
-            threading.Event().wait(_AMP_INTERVAL)   # non-blocking sleep
-        overlay.push_amplitude(0.0)
-
-    amp_thread = threading.Thread(target=_push_amplitudes, daemon=True)
-
-    with sd.OutputStream(
-        samplerate=sample_rate,
-        channels=channels,
-        dtype="float32",
-        callback=_callback,
-        finished_callback=done_event.set,
-    ):
-        amp_thread.start()
-        done_event.wait()   # block calling thread until audio finishes (not Qt thread)
-
 
 async def speak(text: str) -> None:
     """Speak a short local response, falling back to console only on failure."""
     try:
-        audio_bytes, fmt = await voice.synthesise(text)
-        if fmt != "wav":
-            audio_bytes = await asyncio.to_thread(voice.mp3_to_wav_bytes, audio_bytes)
-        # Run blocking playback on a thread pool so the asyncio loop stays free
-        await asyncio.to_thread(play_wav_bytes, audio_bytes)
+        if voice._elevenlabs_api_key():
+            audio_bytes, fmt = await voice.synthesise(text)
+            if fmt != "wav":
+                audio_bytes = await asyncio.to_thread(voice.mp3_to_wav_bytes, audio_bytes)
+            await asyncio.to_thread(voice_playback.play_wav_bytes, audio_bytes)
+        else:
+            import queue as _queue
+            pcm_queue: _queue.Queue = _queue.Queue()
+
+            async def _feed() -> None:
+                async for chunk in voice.synthesise_stream(text):
+                    pcm_queue.put(chunk)
+                pcm_queue.put(None)
+
+            await asyncio.gather(
+                _feed(),
+                asyncio.to_thread(voice_playback.play_pcm_stream, pcm_queue),
+            )
     except Exception as exc:
         logger.warning("Local TTS playback failed: %s", exc)
         overlay.set_transcript("", f"[TTS failed] {text}")
