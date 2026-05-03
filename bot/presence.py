@@ -191,13 +191,13 @@ async def _send_alert(frame: "np.ndarray") -> "asyncio.Future[str] | None":
         register_presence_future(token, future)
 
         keyboard = [[
-            {"text": "✅ Allow",      "callback_data": f"presence_allow_{token}"},
-            {"text": "🔒 Lock Screen", "callback_data": f"presence_lock_{token}"},
+            {"text": "Allow",      "callback_data": f"presence_allow_{token}"},
+            {"text": "Lock Screen", "callback_data": f"presence_lock_{token}"},
         ]]
 
         png = await asyncio.to_thread(_frame_to_png, frame)
         msg_id = await notifier.send_photo_with_buttons(
-            caption="⚠️ Unrecognised person detected at your system. Allow or lock?",
+            caption="Unrecognised person detected at your system. Allow or lock?",
             png_bytes=png,
             keyboard=keyboard,
         )
@@ -256,7 +256,8 @@ async def _loop(speak_fn: SpeakFn) -> None:
         _state = _State.ACTIVE
         while True:
             await asyncio.sleep(10)
-            idle = time.monotonic() - _last_activity
+            from bot.mode import get_last_input_seconds
+            idle = get_last_input_seconds()
             if idle >= idle_seconds:
                 break
 
@@ -285,6 +286,11 @@ async def _loop(speak_fn: SpeakFn) -> None:
                 ui_mode.activate("presence: empty")
             except Exception:
                 pass
+            try:
+                from bot import notifier
+                await notifier.send("🔒 Autonomous mode activated — no one detected at the system.")
+            except Exception:
+                pass
 
             _wake_phrase_event.clear()
 
@@ -309,55 +315,62 @@ async def _loop(speak_fn: SpeakFn) -> None:
                         ui_mode.deactivate("presence: owner returned")
                     except Exception:
                         pass
+                    try:
+                        from bot import notifier
+                        await notifier.send("Autonomous mode deactivated — owner recognised.")
+                    except Exception:
+                        pass
                     await speak_fn("Welcome back.")
                     on_activity()
                     break
 
                 elif recheck_result == _CheckResult.STRANGER:
-                    # Someone unknown — escalate to LOCKED
+                    # Someone unknown — escalate to LOCKED and wait for Telegram reply.
+                    # No more webcam rechecks until a decision arrives.
                     _state = _State.LOCKED
                     logger.info("Presence: stranger detected — sending Telegram alert")
-                    future = await _send_alert(recheck_frame)
-                    if future is None:
-                        # Alert failed — stay locked, retry next cycle
-                        _state = _State.EMPTY
-                        continue
 
-                    try:
-                        decision = await asyncio.wait_for(future, timeout=_CONFIRM_TIMEOUT_S)
-                    except asyncio.TimeoutError:
-                        logger.info("Presence: Telegram alert timed out — keeping locked")
-                        _PENDING.pop(next((k for k, v in _PENDING.items() if v is future), ""), None)
-                        _state = _State.LOCKED
-                        continue
+                    while _state == _State.LOCKED:
+                        future = await _send_alert(recheck_frame)
+                        if future is None:
+                            logger.warning("Presence: alert send failed — retrying in 30s")
+                            await asyncio.sleep(30)
+                            continue
 
-                    if decision == "allow":
-                        logger.info("Presence: Telegram allow — unlocking")
-                        _state = _State.ACTIVE
                         try:
-                            from bot import ui_mode
-                            ui_mode.deactivate("presence: telegram allow")
-                        except Exception:
-                            pass
-                        on_activity()
-                        break
-                    else:
-                        logger.info("Presence: Telegram lock — locking Windows screen")
-                        await asyncio.to_thread(_lock_windows_screen)
-                        # After lock screen, reset to ACTIVE (user will re-auth via Windows)
-                        _state = _State.ACTIVE
-                        try:
-                            from bot import ui_mode
-                            ui_mode.deactivate("presence: screen locked")
-                        except Exception:
-                            pass
-                        on_activity()
-                        break
+                            decision = await asyncio.wait_for(future, timeout=_CONFIRM_TIMEOUT_S)
+                        except asyncio.TimeoutError:
+                            logger.info("Presence: Telegram alert timed out — resending")
+                            _PENDING.pop(next((k for k, v in _PENDING.items() if v is future), ""), None)
+                            continue  # re-send alert, still LOCKED, no webcam check
+
+                        if decision == "allow":
+                            logger.info("Presence: Telegram allow — unlocking")
+                            _state = _State.ACTIVE
+                            try:
+                                from bot import ui_mode
+                                ui_mode.deactivate("presence: telegram allow")
+                            except Exception:
+                                pass
+                            on_activity()
+                        else:
+                            logger.info("Presence: Telegram lock — locking Windows screen")
+                            await asyncio.to_thread(_lock_windows_screen)
+                            _state = _State.ACTIVE
+                            try:
+                                from bot import ui_mode
+                                ui_mode.deactivate("presence: screen locked")
+                            except Exception:
+                                pass
+                            on_activity()
+
+                    break  # exit the EMPTY while loop — state is now ACTIVE
                 # EMPTY or ERROR — keep waiting
             continue
 
         if result == _CheckResult.STRANGER:
-            # Stranger seen on initial check (while system was idle)
+            # Stranger seen on initial check (while system was idle).
+            # Stay LOCKED and keep re-sending alert until a decision arrives.
             _state = _State.LOCKED
             logger.info("Presence: stranger on initial check — sending Telegram alert")
             try:
@@ -366,37 +379,38 @@ async def _loop(speak_fn: SpeakFn) -> None:
             except Exception:
                 pass
 
-            future = await _send_alert(frame)
-            if future is None:
-                on_activity()
-                continue
+            while _state == _State.LOCKED:
+                future = await _send_alert(frame)
+                if future is None:
+                    logger.warning("Presence: alert send failed — retrying in 30s")
+                    await asyncio.sleep(30)
+                    continue
 
-            try:
-                decision = await asyncio.wait_for(future, timeout=_CONFIRM_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                logger.info("Presence: alert timed out — keeping locked")
+                try:
+                    decision = await asyncio.wait_for(future, timeout=_CONFIRM_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    logger.info("Presence: alert timed out — resending")
+                    _PENDING.pop(next((k for k, v in _PENDING.items() if v is future), ""), None)
+                    continue  # re-send, no webcam check
+
+                if decision == "allow":
+                    logger.info("Presence: Telegram allow — unlocking")
+                    try:
+                        from bot import ui_mode
+                        ui_mode.deactivate("presence: telegram allow")
+                    except Exception:
+                        pass
+                else:
+                    logger.info("Presence: Telegram lock — locking Windows screen")
+                    await asyncio.to_thread(_lock_windows_screen)
+                    try:
+                        from bot import ui_mode
+                        ui_mode.deactivate("presence: screen locked")
+                    except Exception:
+                        pass
+
                 _state = _State.ACTIVE
                 on_activity()
-                continue
-
-            if decision == "allow":
-                logger.info("Presence: Telegram allow — unlocking")
-                try:
-                    from bot import ui_mode
-                    ui_mode.deactivate("presence: telegram allow")
-                except Exception:
-                    pass
-            else:
-                logger.info("Presence: Telegram lock — locking Windows screen")
-                await asyncio.to_thread(_lock_windows_screen)
-                try:
-                    from bot import ui_mode
-                    ui_mode.deactivate("presence: screen locked")
-                except Exception:
-                    pass
-
-            _state = _State.ACTIVE
-            on_activity()
 
 
 def start(speak_fn: SpeakFn) -> None:

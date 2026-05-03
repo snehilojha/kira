@@ -28,6 +28,7 @@ data/
 .idea/
 .claude/
 *.code-workspace
+CLAUDE.md
 
 # OS
 .DS_Store
@@ -38,4 +39,3 @@ context.md
 telegram_runner_spec.md
 config/
 ROADMAP.md
-hermes_agent_repo/
