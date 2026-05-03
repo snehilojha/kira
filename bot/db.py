@@ -56,6 +56,20 @@ async def init_db(db_path: Path | str | None = None) -> None:
 
     await _conn.executescript(_SCHEMA)
     await _conn.commit()
+
+    # Add columns introduced after initial schema (ALTER TABLE IF NOT EXISTS is not
+    # supported in older SQLite — catch the "duplicate column" error instead)
+    for table, col, typedef in [
+        ("world_snapshots", "weather", "TEXT"),
+        ("world_snapshots", "stocks", "TEXT"),
+        ("conversation_log", "channel", "TEXT NOT NULL DEFAULT 'telegram'"),
+    ]:
+        try:
+            await _conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
+            await _conn.commit()
+        except Exception:
+            pass  # column already exists
+
     logger.info("Database initialised at %s", resolved)
 
 
@@ -82,7 +96,8 @@ CREATE TABLE IF NOT EXISTS conversation_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp  TEXT    NOT NULL DEFAULT (datetime('now')),
     role       TEXT    NOT NULL,  -- 'user' or 'assistant'
-    content    TEXT    NOT NULL
+    content    TEXT    NOT NULL,
+    channel    TEXT    NOT NULL DEFAULT 'telegram'  -- 'telegram' or 'voice'
 );
 
 CREATE TABLE IF NOT EXISTS run_history (
@@ -145,37 +160,82 @@ CREATE TABLE IF NOT EXISTS world_snapshots (
     btc_price   REAL,
     eth_price   REAL,
     fear_greed  INTEGER,
-    top_news    TEXT
+    top_news    TEXT,
+    weather     TEXT,
+    stocks      TEXT
+);
+
+CREATE TABLE IF NOT EXISTS monitor_jobs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id                TEXT    NOT NULL UNIQUE,
+    name                  TEXT    NOT NULL,
+    subject               TEXT    NOT NULL,
+    condition             TEXT    NOT NULL,
+    poll_interval_seconds REAL    NOT NULL,
+    success_action        TEXT    NOT NULL,
+    failure_action        TEXT,
+    expiry_at             TEXT,
+    requires_model        TEXT    NOT NULL DEFAULT 'fast',
+    cooldown_seconds      REAL    NOT NULL DEFAULT 300,
+    status                TEXT    NOT NULL DEFAULT 'active',
+    created_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+    last_fired_at         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS mode_transitions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_mode   TEXT,
+    to_mode     TEXT    NOT NULL,
+    reason      TEXT,
+    occurred_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS vision_triggers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trigger_type    TEXT    NOT NULL,
+    process_label   TEXT,
+    interpretation  TEXT,
+    notified        INTEGER NOT NULL DEFAULT 0,
+    occurred_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS voice_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp   TEXT    NOT NULL DEFAULT (datetime('now')),
+    transcript  TEXT    NOT NULL,
+    result      TEXT    NOT NULL,
+    intent      TEXT    NOT NULL DEFAULT 'brain'
 );
 """
 
 
 # ── Conversation helpers ──────────────────────────────────────────
 
-async def log_conversation(role: str, content: str) -> None:
+async def log_conversation(role: str, content: str, channel: str = "telegram") -> None:
     """Insert a conversation entry.
 
     Args:
         role: ``"user"`` or ``"assistant"``.
         content: The message text (truncated to 4000 chars for safety).
+        channel: ``"telegram"`` or ``"voice"``.
     """
     conn = _get_conn()
     await conn.execute(
-        "INSERT INTO conversation_log (role, content) VALUES (?, ?)",
-        (role, content[:4000]),
+        "INSERT INTO conversation_log (role, content, channel) VALUES (?, ?, ?)",
+        (role, content[:4000], channel),
     )
     await conn.commit()
 
 
 async def get_recent_conversations(n: int = 10) -> list[dict[str, Any]]:
-    """Return the last *n* conversation entries, oldest first.
+    """Return the last *n* conversation entries across all channels, oldest first.
 
     Returns:
-        List of dicts with keys: ``id``, ``timestamp``, ``role``, ``content``.
+        List of dicts with keys: ``id``, ``timestamp``, ``role``, ``content``, ``channel``.
     """
     conn = _get_conn()
     cursor = await conn.execute(
-        "SELECT id, timestamp, role, content "
+        "SELECT id, timestamp, role, content, channel "
         "FROM conversation_log ORDER BY id DESC LIMIT ?",
         (n,),
     )
@@ -490,15 +550,22 @@ async def save_world_snapshot(snapshot: dict[str, Any]) -> int:
     if top_news is not None and not isinstance(top_news, str):
         top_news = _json.dumps(top_news)
 
+    weather = snapshot.get("weather")
+    stocks = snapshot.get("stocks")
+    if stocks is not None and not isinstance(stocks, str):
+        stocks = _json.dumps(stocks)
+
     conn = _get_conn()
     cursor = await conn.execute(
-        "INSERT INTO world_snapshots (btc_price, eth_price, fear_greed, top_news) "
-        "VALUES (?, ?, ?, ?)",
+        "INSERT INTO world_snapshots (btc_price, eth_price, fear_greed, top_news, weather, stocks) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
         (
             snapshot.get("btc_price"),
             snapshot.get("eth_price"),
             snapshot.get("fear_greed"),
             top_news,
+            weather,
+            stocks,
         ),
     )
     await conn.commit()
@@ -518,3 +585,208 @@ async def get_recent_world_snapshot() -> dict[str, Any] | None:
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+# ── Monitor job helpers ───────────────────────────────────────────
+
+async def save_monitor_job(job: dict[str, Any]) -> int:
+    """Persist a new monitor job.
+
+    Args:
+        job: Dict with keys matching the monitor_jobs table columns.
+
+    Returns:
+        The rowid of the new entry.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "INSERT INTO monitor_jobs "
+        "(job_id, name, subject, condition, poll_interval_seconds, "
+        " success_action, failure_action, expiry_at, requires_model, "
+        " cooldown_seconds, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            job["job_id"],
+            job["name"],
+            job["subject"],
+            job["condition"],
+            job["poll_interval_seconds"],
+            job["success_action"],
+            job.get("failure_action"),
+            job.get("expiry_at"),
+            job.get("requires_model", "fast"),
+            job.get("cooldown_seconds", 300.0),
+            job.get("status", "active"),
+        ),
+    )
+    await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def get_active_monitor_jobs() -> list[dict[str, Any]]:
+    """Return all monitor jobs with status 'active' or 'paused'.
+
+    Returns:
+        List of dicts with all monitor_jobs columns.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT * FROM monitor_jobs WHERE status IN ('active', 'paused') "
+        "ORDER BY id ASC",
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def get_all_monitor_jobs() -> list[dict[str, Any]]:
+    """Return all monitor jobs regardless of status.
+
+    Returns:
+        List of dicts with all monitor_jobs columns, newest first.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT * FROM monitor_jobs ORDER BY id DESC",
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def update_monitor_job_status(job_id: str, status: str) -> None:
+    """Update the status of a monitor job.
+
+    Args:
+        job_id: The unique job identifier.
+        status: One of ``'active'``, ``'paused'``, ``'cancelled'``, ``'expired'``, ``'fired'``.
+    """
+    conn = _get_conn()
+    await conn.execute(
+        "UPDATE monitor_jobs SET status = ? WHERE job_id = ?",
+        (status, job_id),
+    )
+    await conn.commit()
+
+
+async def update_monitor_job_last_fired(job_id: str, fired_at: str) -> None:
+    """Record when a monitor job last sent a notification.
+
+    Args:
+        job_id: The unique job identifier.
+        fired_at: ISO timestamp of the firing event.
+    """
+    conn = _get_conn()
+    await conn.execute(
+        "UPDATE monitor_jobs SET last_fired_at = ? WHERE job_id = ?",
+        (fired_at, job_id),
+    )
+    await conn.commit()
+
+
+# ── Mode transition helpers ───────────────────────────────────────
+
+async def log_mode_transition(
+    from_mode: str | None,
+    to_mode: str,
+    reason: str = "",
+) -> None:
+    """Persist one mode transition event.
+
+    Args:
+        from_mode: The previous mode, or None if this is the initial state.
+        to_mode: The new mode name.
+        reason: Short human-readable explanation for the transition.
+    """
+    conn = _get_conn()
+    await conn.execute(
+        "INSERT INTO mode_transitions (from_mode, to_mode, reason) VALUES (?, ?, ?)",
+        (from_mode, to_mode, reason),
+    )
+    await conn.commit()
+
+
+async def get_recent_mode_transitions(limit: int = 20) -> list[dict[str, Any]]:
+    """Return the most recent mode transitions, newest first.
+
+    Returns:
+        List of dicts with keys: ``id``, ``from_mode``, ``to_mode``,
+        ``reason``, ``occurred_at``.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT id, from_mode, to_mode, reason, occurred_at "
+        "FROM mode_transitions ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Vision trigger helpers ────────────────────────────────────────
+
+async def log_vision_trigger(
+    trigger_type: str,
+    process_label: str = "",
+    interpretation: str = "",
+    notified: bool = False,
+) -> int:
+    """Persist a screen-vision trigger event.
+
+    Args:
+        trigger_type: One of the four TriggerType literals.
+        process_label: Process or context that caused the trigger.
+        interpretation: Vision model's interpretation of the screenshot.
+        notified: Whether a Telegram notification was sent.
+
+    Returns:
+        The rowid of the new entry.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "INSERT INTO vision_triggers (trigger_type, process_label, interpretation, notified) "
+        "VALUES (?, ?, ?, ?)",
+        (trigger_type, process_label or "", interpretation or "", 1 if notified else 0),
+    )
+    await conn.commit()
+    return cursor.lastrowid  # type: ignore[return-value]
+
+
+async def get_recent_vision_triggers(limit: int = 10) -> list[dict[str, Any]]:
+    """Return the most recent vision trigger events, newest first.
+
+    Returns:
+        List of dicts with keys: ``id``, ``trigger_type``, ``process_label``,
+        ``interpretation``, ``notified``, ``occurred_at``.
+    """
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT id, trigger_type, process_label, interpretation, notified, occurred_at "
+        "FROM vision_triggers ORDER BY id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ── Voice log helpers ─────────────────────────────────────────────
+
+async def log_voice_command(transcript: str, result: str, intent: str = "brain") -> None:
+    """Persist one voice exchange to the behavioral log."""
+    conn = _get_conn()
+    await conn.execute(
+        "INSERT INTO voice_log (transcript, result, intent) VALUES (?, ?, ?)",
+        (transcript[:1000], result[:500], intent),
+    )
+    await conn.commit()
+
+
+async def get_voice_log(days: int = 7) -> list[dict[str, Any]]:
+    """Return voice commands from the last *days* days, oldest first."""
+    conn = _get_conn()
+    cursor = await conn.execute(
+        "SELECT timestamp, transcript, result, intent FROM voice_log "
+        "WHERE timestamp >= datetime('now', ? || ' days') "
+        "ORDER BY id ASC",
+        (f"-{days}",),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]

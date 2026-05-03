@@ -7,6 +7,7 @@ and starts the long-polling event loop.
 import logging
 import os
 import sys
+import threading
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -18,12 +19,21 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 
 from bot import db
 from bot import handlers
+from bot import job_monitor
+from bot import local_voice
 from bot import memory
+from bot import mode
 from bot import monitor
 from bot import observer
 from bot import notifier
+from bot import overlay
+from bot import ui_mode
 from bot import scheduler
+from bot import task_state
 from bot import watchdog
+from bot import world
+from bot import presence
+from bot import reflector
 from bot.auth import load_allowed_users
 
 # ── Paths ─────────────────────────────────────────────────────────
@@ -94,44 +104,37 @@ async def _error_handler(update: object, context) -> None:
     logger.error("Unhandled exception in handler", exc_info=exc)
 
 
-def main() -> None:
-    """Load config, register handlers, start polling."""
-    # 1. Load environment
-    load_dotenv(_ENV_PATH)
-    token = os.environ.get("BOT_TOKEN")
-    if not token or token == "your_telegram_bot_token_here":
-        print("ERROR: Set a valid BOT_TOKEN in .env before starting.")
-        sys.exit(1)
+def _build_ptb_app(token: str):
+    """Build and return the PTB Application with all handlers registered."""
 
-    # 2. Logging
-    _setup_logging()
-    logger = logging.getLogger(__name__)
-    logger.info("telegram-runner starting up")
-
-    # 2a. Wait for network before doing anything Telegram-related
-    if not _wait_for_network():
-        logger.error("Network unavailable after 120s — aborting startup")
-        sys.exit(1)
-
-    # 3. Init shared modules
-    load_allowed_users()
-    notifier.init()
-    handlers.load_config()
-
-    # 4. Build application
     async def _post_init(application) -> None:
-        """Start background tasks once the Telegram application is ready."""
         await db.init_db()
         await handlers.reload_reminders()
         await scheduler.reload_from_db(handlers._scheduled_run_callback)
         await watchdog.reload_from_db()
+        await job_monitor.reload_from_db()
+        interrupted = task_state.mark_interrupted_tasks(
+            "Bot restarted before the task reached a terminal state."
+        )
+        if interrupted:
+            await notifier.send(
+                "Kira restarted with unfinished complex task(s). "
+                f"Marked {len(interrupted)} task(s) as interrupted; no actions were replayed. "
+                "Use /tasks to inspect them."
+            )
         application.create_task(monitor.start_monitor())
         application.create_task(memory.start_daily_summariser())
         application.create_task(observer.start())
+        application.create_task(observer.start_fast_loop())
+        application.create_task(job_monitor.start())
+        application.create_task(mode.start())
+        application.create_task(world.start())
+        application.create_task(local_voice.start_as_task())
+        application.create_task(reflector.start_weekly_reflector())
+        presence.start(local_voice.speak)
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()
 
-    # 5. Register command handlers
     command_map = {
         "run": handlers.handle_run,
         "shell": handlers.handle_shell,
@@ -166,60 +169,102 @@ def main() -> None:
         "close_apps": handlers.handle_close_apps,
         "help": handlers.handle_help,
         "ask": handlers.handle_ask,
+        "tasks": handlers.handle_tasks,
+        "task": handlers.handle_task,
         "history": handlers.handle_history,
         "runs": handlers.handle_runs,
         "summarise": handlers.handle_summarise,
+        "reflect": handlers.handle_reflect,
         "recall": handlers.handle_recall,
+        "jobs": handlers.handle_jobs,
+        "canceljob": handlers.handle_cancel_job,
+        "pausejob": handlers.handle_pause_job,
+        "resumejob": handlers.handle_resume_job,
+        "mode": handlers.handle_mode,
     }
-
     for name, handler in command_map.items():
         app.add_handler(CommandHandler(name, handler))
 
-    # 6. Register error handler so NetworkErrors don't crash the polling loop
     app.add_error_handler(_error_handler)
 
-    # 7. Unified callback handler for all inline buttons (confirmations and /ask)
     async def unified_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Route callback queries to appropriate handlers."""
         query = update.callback_query
         data = query.data or ""
-        
-        if data.startswith("ask_"):
+        if data.startswith("ask_") or data.startswith("brain_"):
             await handlers.handle_ask_callback(update, context)
         else:
             await handlers.handle_callback_query(update, context)
-    
+
     app.add_handler(CallbackQueryHandler(unified_callback_handler))
 
-    # 8a. Media messages with /putfile caption — CommandHandler won't fire on these
     _media_filter = (
-        filters.Document.ALL
-        | filters.PHOTO
-        | filters.VIDEO
-        | filters.AUDIO
-        | filters.VOICE
-        | filters.ANIMATION
+        filters.Document.ALL | filters.PHOTO | filters.VIDEO
+        | filters.AUDIO | filters.VOICE | filters.ANIMATION
     )
-    app.add_handler(
-        MessageHandler(
-            _media_filter & filters.CaptionRegex(r"(?i)^/putfile"),
-            handlers.handle_putfile,
-        )
-    )
+    app.add_handler(MessageHandler(
+        _media_filter & filters.CaptionRegex(r"(?i)^/putfile"),
+        handlers.handle_putfile,
+    ))
+    app.add_handler(MessageHandler(
+        filters.VOICE & ~filters.CaptionRegex(r"(?i)^/putfile"),
+        handlers.handle_voice,
+    ))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND,
+        handlers.handle_text,
+    ))
 
-    # 8b. Voice messages WITHOUT a /putfile caption → Kira voice interface.
-    # Intentionally narrow: VOICE only (not AUDIO), excluding /putfile captions
-    # so we don't intercept legitimate file saves sent as voice messages.
-    app.add_handler(
-        MessageHandler(
-            filters.VOICE & ~filters.CaptionRegex(r"(?i)^/putfile"),
-            handlers.handle_voice,
-        )
-    )
+    return app
 
-    # 8. Start polling
+
+def _run_bot(ptb_app) -> None:
+    """Run PTB polling loop on a background thread with its own event loop."""
+    import asyncio
+    logger = logging.getLogger(__name__)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     logger.info("Bot is live — polling for updates")
-    app.run_polling(drop_pending_updates=True)
+    try:
+        ptb_app.run_polling(drop_pending_updates=True)
+    finally:
+        loop.close()
+
+
+def main() -> None:
+    """Load config, start Qt overlay on main thread, run bot on background thread."""
+    # 1. Load environment
+    load_dotenv(_ENV_PATH)
+    token = os.environ.get("BOT_TOKEN")
+    if not token or token == "your_telegram_bot_token_here":
+        print("ERROR: Set a valid BOT_TOKEN in .env before starting.")
+        sys.exit(1)
+
+    # 2. Logging
+    _setup_logging()
+    logger = logging.getLogger(__name__)
+    logger.info("telegram-runner starting up")
+
+    # 3. Wait for network
+    if not _wait_for_network():
+        logger.error("Network unavailable after 120s — aborting startup")
+        sys.exit(1)
+
+    # 4. Init shared modules
+    load_allowed_users()
+    notifier.init()
+    handlers.load_config()
+
+    # 5. Build PTB app
+    ptb_app = _build_ptb_app(token)
+
+    # 6. Start bot on a background thread so main thread is free for Qt
+    bot_thread = threading.Thread(
+        target=_run_bot, args=(ptb_app,), daemon=True, name="kira-bot"
+    )
+    bot_thread.start()
+
+    # 7. Start Qt overlay on the main thread (Qt requires this)
+    overlay.start_on_main_thread()
 
 
 if __name__ == "__main__":

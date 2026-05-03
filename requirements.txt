@@ -10,3 +10,9 @@ mss
 httpx
 openai>=1.0.0
 aiosqlite
+tiktoken
+sounddevice
+numpy
+keyboard
+yfinance
+opencv-python

@@ -23,25 +23,135 @@ import asyncio
 import logging
 import os
 import subprocess
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from bot import provider
 
 logger = logging.getLogger(__name__)
 
-_OBSERVER_INTERVAL = int(os.environ.get("OBSERVER_INTERVAL", "40000")) 
+_OBSERVER_INTERVAL = int(os.environ.get("OBSERVER_INTERVAL", "40000"))
 _RECENT_FILE_HOURS = 48
 _MAX_FILES_PER_ROOT = 20
 _MAX_LOG_TAIL_LINES = 30
 _GPT_MODEL = "gpt-4o-mini"
 
-# Module-level cached context string
+# Seconds with no new log output before a process is considered potentially stalled.
+_STALL_THRESHOLD_SECONDS = float(os.environ.get("KIRA_STALL_THRESHOLD_SECONDS", "300"))
+_FAST_LOOP_INTERVAL = 30  # seconds
+_HIGH_CPU_THRESHOLD = 90.0  # percent
+_HIGH_CPU_DURATION = 600    # seconds sustained before alerting
+
+# Module-level cached context string and raw snapshot.
 _CURRENT_CONTEXT_SUMMARY: str = ""
+_raw_snapshot_cache: dict = {}
+
+# Fast-loop state — tracks what has already been notified to avoid repeat pings
+_notified: set[str] = set()
+_high_cpu_since: dict[int, float] = {}
+_low_cpu_since: dict[int, float] = {}
+_LOW_CPU_STDIN_DURATION = int(os.environ.get("KIRA_STDIN_DETECT_SECONDS", "120"))
+
+# Absence log — records escalation events that fired during autonomous mode.
+# Cleared when the user returns. Read by mode.py for the return summary.
+_absence_log: list[str] = []
+
+# Maps Telegram message_id → alert description so handle_text can attach
+# context when the user replies to an escalation message.
+_escalation_context: dict[int, str] = {}
+_ESCALATION_CONTEXT_MAX = 20
+
+
+def get_escalation_context(message_id: int) -> str | None:
+    """Return the alert description for a Telegram message_id, or None."""
+    return _escalation_context.get(message_id)
+
+
+def _store_escalation_context(message_id: int, description: str) -> None:
+    if len(_escalation_context) >= _ESCALATION_CONTEXT_MAX:
+        oldest = next(iter(_escalation_context))
+        del _escalation_context[oldest]
+    _escalation_context[message_id] = description
+
+
+def get_absence_log() -> list[str]:
+    """Return escalation events that fired during the current autonomous period."""
+    return list(_absence_log)
+
+
+def clear_absence_log() -> None:
+    """Clear the absence log. Called by mode.py when user returns."""
+    _absence_log.clear()
 
 
 def get_current_context() -> str:
     """Return the latest GPT-summarised machine context, or empty string if not ready."""
     return _CURRENT_CONTEXT_SUMMARY
+
+
+# ── Active project context cache ──────────────────────────────────
+
+# Keyed by project folder path string → summary string
+_project_context_cache: dict[str, str] = {}
+# Last window title we parsed — avoid recomputing on every brain call
+_last_foreground_title: str = ""
+_active_project_context: str = ""
+_last_active_folder: str = ""
+
+# Optional callback fired when the user switches to a different project.
+# Signature: (project_summary: str) -> None  (sync, called via ensure_future)
+_project_switch_callback: "Callable[[str], Any] | None" = None
+
+
+def get_active_project_context() -> str:
+    """Return the pre-emptive context for the project currently in focus."""
+    return _active_project_context
+
+
+def register_project_switch_callback(fn: "Callable[[str], Any]") -> None:
+    """Register a callback invoked when the active project changes.
+
+    ``fn`` receives the project summary string. It may be a coroutine function;
+    if so it is scheduled with ``asyncio.ensure_future``.
+    """
+    global _project_switch_callback
+    _project_switch_callback = fn
+
+
+def get_pending_triggers() -> list[str]:
+    """Return screen-vision trigger types that are currently active.
+
+    Inspects the cached raw snapshot for ambiguity conditions. Called by the
+    observer after each cycle to decide whether to fire screen_vision.
+
+    Returns:
+        List of TriggerType strings (may be empty).
+    """
+    triggers: list[str] = []
+    snapshot = _raw_snapshot_cache
+
+    if not snapshot:
+        return triggers
+
+    dialog = snapshot.get("dialog_detected")
+    if dialog:
+        triggers.append("dialog_appeared")
+
+    stalled = snapshot.get("stalled_processes", [])
+    for proc in stalled:
+        label = proc.get("alias", "")
+        if "cursor" in label.lower():
+            triggers.append("cursor_ai_stalled")
+        else:
+            triggers.append("process_frozen")
+
+    stdin_blocked = snapshot.get("stdin_blocked_processes", [])
+    if stdin_blocked:
+        triggers.append("stdin_silent")
+
+    return triggers
 
 
 async def start() -> None:
@@ -60,11 +170,183 @@ async def start() -> None:
         await asyncio.sleep(_OBSERVER_INTERVAL)
 
 
+async def start_fast_loop() -> None:
+    """Fast escalation loop — checks urgent conditions every 30 seconds."""
+    logger.info("Observer fast loop started (interval=%ds)", _FAST_LOOP_INTERVAL)
+    while True:
+        try:
+            await _run_fast_cycle()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Observer fast cycle failed")
+        await asyncio.sleep(_FAST_LOOP_INTERVAL)
+
+
+async def _run_fast_cycle() -> None:
+    """Check urgent conditions and ping Telegram if something needs attention."""
+    from bot import mode as kira_mode
+    from bot import notifier
+
+    # Always update low-cpu timers regardless of autonomous state,
+    # so the stdin detection clock starts from when the process went idle,
+    # not from when the user walked away.
+    await asyncio.to_thread(_update_process_timers)
+
+    # Keep active project context fresh on every fast tick
+    title = await asyncio.to_thread(_collect_foreground_window)
+    if title:
+        await _refresh_active_project_context(title)
+
+    autonomous = kira_mode.is_autonomous()
+    logger.debug("Fast cycle: autonomous=%s", autonomous)
+    if not autonomous:
+        # User is back — clear notifications so they can re-fire next absence.
+        _notified.clear()
+        return
+
+    # Remove stale notified keys for pids that no longer exist.
+    live_pids = {p["pid"] for p in _collect_watched_procs()}
+    stale = {k for k in _notified if "_" in k and k.split("_")[1].isdigit()
+             and int(k.split("_")[1]) not in live_pids}
+    _notified.difference_update(stale)
+
+    events = await asyncio.to_thread(_collect_fast_snapshot)
+    logger.debug("Fast cycle: %d events found", len(events))
+    for event_key, message in events:
+        if event_key in _notified:
+            continue
+        _notified.add(event_key)
+        logger.info("Escalating to Telegram: %s", event_key)
+        _absence_log.append(message)
+        try:
+            png = await asyncio.to_thread(_get_screenshot_bytes)
+            caption = f"Kira: {message}"
+            if png:
+                msg_id = await notifier.send_photo(caption, png)
+            else:
+                msg_id = await notifier.send(caption)
+            if msg_id:
+                _store_escalation_context(msg_id, message)
+        except Exception as exc:
+            logger.warning("Escalation notify failed: %s", exc)
+
+
+_WATCHED_PROCESS_NAMES = {"python.exe", "pythonw.exe", "code.exe"}
+_MIN_RUNTIME_SECONDS = 60  # ignore quick one-off processes
+
+
+def _collect_watched_procs() -> list[dict]:
+    """Return user-owned Python and VSCode processes running longer than 60s."""
+    try:
+        import psutil
+    except ImportError:
+        return []
+
+    procs = []
+    current_user = None
+    try:
+        current_user = psutil.Process().username()
+    except Exception:
+        pass
+
+    for ps in psutil.process_iter(["pid", "name", "username", "create_time", "cmdline", "status"]):
+        try:
+            info = ps.info
+            if info["name"] not in _WATCHED_PROCESS_NAMES:
+                continue
+            if current_user and info.get("username") != current_user:
+                continue
+            runtime = time.time() - (info["create_time"] or time.time())
+            if runtime < _MIN_RUNTIME_SECONDS:
+                continue
+            cmdline = " ".join(info.get("cmdline") or [])
+            procs.append({
+                "pid": info["pid"],
+                "name": info["name"],
+                "cmdline": cmdline[:120],
+                "runtime_seconds": runtime,
+                "status": info.get("status", ""),
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    return procs
+
+
+def _update_process_timers() -> None:
+    """Update low/high CPU timers for all watched processes. Called every cycle."""
+    import psutil
+
+    watched = _collect_watched_procs()
+    live_pids = {p["pid"] for p in watched}
+
+    for pid in list(_high_cpu_since):
+        if pid not in live_pids:
+            _high_cpu_since.pop(pid, None)
+    for pid in list(_low_cpu_since):
+        if pid not in live_pids:
+            _low_cpu_since.pop(pid, None)
+
+    for proc in watched:
+        pid = proc["pid"]
+        runtime = proc["runtime_seconds"]
+        try:
+            ps = psutil.Process(pid)
+            cpu = ps.cpu_percent(interval=0.5)
+            if cpu < 1.0 and runtime > 60:
+                _low_cpu_since.setdefault(pid, time.monotonic())
+            else:
+                _low_cpu_since.pop(pid, None)
+
+            if cpu >= _HIGH_CPU_THRESHOLD:
+                _high_cpu_since.setdefault(pid, time.monotonic())
+            else:
+                _high_cpu_since.pop(pid, None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            _low_cpu_since.pop(pid, None)
+            _high_cpu_since.pop(pid, None)
+
+
+def _collect_fast_snapshot() -> list[tuple[str, str]]:
+    """Collect urgent events to ping about. Timers already updated by _update_process_timers."""
+    watched = _collect_watched_procs()
+    events: list[tuple[str, str]] = []
+    now = time.monotonic()
+
+    for proc in watched:
+        pid = proc["pid"]
+        label = proc["cmdline"] or proc["name"]
+
+        # Stdin blocked
+        since = _low_cpu_since.get(pid)
+        if since and now - since >= _LOW_CPU_STDIN_DURATION:
+            events.append((f"stdin_{pid}", f"A script may be waiting for input: {label}"))
+
+        # High CPU sustained
+        since = _high_cpu_since.get(pid)
+        if since and now - since >= _HIGH_CPU_DURATION:
+            events.append((f"highcpu_{pid}", f"A script has been pegging CPU for over {_HIGH_CPU_DURATION // 60} minutes: {label}"))
+
+    # Dialog / UAC
+    dialog = _collect_dialog_state()
+    if dialog:
+        events.append(("dialog", f"A dialog appeared on screen: {dialog}"))
+
+    return events
+
+
+def _get_screenshot_bytes() -> bytes:
+    from bot.screen_vision import take_screenshot_png
+    return take_screenshot_png()
+
+
 async def _run_cycle() -> None:
-    """Collect a snapshot, persist it, and update the cached summary."""
-    global _CURRENT_CONTEXT_SUMMARY
+    """Collect a snapshot, persist it, update the cached summary, dispatch triggers."""
+    global _CURRENT_CONTEXT_SUMMARY, _raw_snapshot_cache
 
     snapshot = await asyncio.to_thread(_collect_snapshot)
+    _raw_snapshot_cache = snapshot
 
     try:
         from bot import db
@@ -75,6 +357,14 @@ async def _run_cycle() -> None:
     summary = await _summarise_snapshot(snapshot)
     _CURRENT_CONTEXT_SUMMARY = summary
     logger.debug("Observer context updated (%d chars)", len(summary))
+
+    # Refresh active project context from current foreground window
+    title = snapshot.get("foreground_window", "")
+    if title:
+        await _refresh_active_project_context(title)
+
+    await _dispatch_triggers()
+    await _maybe_proactive_notify(summary)
 
 
 # ── Snapshot collection ───────────────────────────────────────────
@@ -87,6 +377,10 @@ def _collect_snapshot() -> dict[str, Any]:
     git_statuses = _collect_git_statuses(project_roots)
     running_procs = _collect_running_procs()
     log_tails = _collect_log_tails()
+    foreground_window = _collect_foreground_window()
+    dialog_detected = _collect_dialog_state()
+    stalled_processes = _check_process_stall_state(running_procs)
+    stdin_blocked = _check_stdin_blocked(running_procs)
 
     return {
         "observed_at": datetime.now().isoformat(timespec="seconds"),
@@ -95,6 +389,11 @@ def _collect_snapshot() -> dict[str, Any]:
         "git_status": _format_git_statuses(git_statuses),
         "running_procs": _format_running_procs(running_procs),
         "screen_summary": _format_log_tails(log_tails),
+        # V1.5 additions
+        "foreground_window": foreground_window,
+        "dialog_detected": dialog_detected,
+        "stalled_processes": stalled_processes,
+        "stdin_blocked_processes": stdin_blocked,
     }
 
 
@@ -231,6 +530,196 @@ def _collect_log_tails() -> dict[str, str]:
     return tails
 
 
+# ── V1.5 awareness collectors ─────────────────────────────────────
+
+def _collect_foreground_window() -> str:
+    """Return the title of the currently focused window (Windows only).
+
+    Uses ctypes ``GetForegroundWindow`` + ``GetWindowTextW``. Returns empty
+    string on non-Windows or if the call fails.
+    """
+    import platform
+    import ctypes
+
+    if platform.system() != "Windows":
+        return ""
+
+    try:
+        hwnd = ctypes.windll.user32.GetForegroundWindow()  # type: ignore[attr-defined]
+        if not hwnd:
+            return ""
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)  # type: ignore[attr-defined]
+        if length == 0:
+            return ""
+        buf = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)  # type: ignore[attr-defined]
+        return buf.value.strip()
+    except Exception as exc:
+        logger.debug("GetForegroundWindow failed: %s", exc)
+        return ""
+
+
+def _collect_dialog_state() -> str | None:
+    """Detect the presence of a modal dialog or UAC prompt (Windows only).
+
+    Enumerates top-level windows looking for the Windows dialog class
+    ``#32770`` (common for message boxes and UAC prompts) and other known
+    modal class names. Returns a short description or None.
+    """
+    import platform
+    import ctypes
+
+    if platform.system() != "Windows":
+        return None
+
+    found_dialogs: list[str] = []
+
+    _DIALOG_CLASSES = {"#32770", "ApplicationFrameWindow"}
+
+    try:
+        def _enum_callback(hwnd, _):
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):  # type: ignore[attr-defined]
+                return True
+            buf = ctypes.create_unicode_buffer(256)
+            ctypes.windll.user32.GetClassNameW(hwnd, buf, 256)  # type: ignore[attr-defined]
+            cls = buf.value.strip()
+            if cls in _DIALOG_CLASSES:
+                title_buf = ctypes.create_unicode_buffer(256)
+                ctypes.windll.user32.GetWindowTextW(hwnd, title_buf, 256)  # type: ignore[attr-defined]
+                title = title_buf.value.strip()
+                if title:
+                    found_dialogs.append(f"{cls}: {title}")
+            return True
+
+        _EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)  # type: ignore[attr-defined]
+        ctypes.windll.user32.EnumWindows(_EnumWindowsProc(_enum_callback), 0)  # type: ignore[attr-defined]
+    except Exception as exc:
+        logger.debug("EnumWindows failed: %s", exc)
+        return None
+
+    if found_dialogs:
+        return "; ".join(found_dialogs)
+    return None
+
+
+def _check_process_stall_state(running_procs: list[dict]) -> list[dict]:
+    """Return processes that appear stalled (running too long with no log output).
+
+    A process is considered stalled if:
+    - It has been running for more than _STALL_THRESHOLD_SECONDS, AND
+    - Its log file has not been modified in the last _STALL_THRESHOLD_SECONDS.
+
+    Args:
+        running_procs: List of process dicts from process_registry.
+
+    Returns:
+        List of stalled process dicts (subset of running_procs).
+    """
+    import time
+
+    stalled: list[dict] = []
+    now = time.time()
+
+    for proc in running_procs:
+        # Skip processes that have already exited.
+        if proc.get("returncode") is not None:
+            continue
+
+        runtime = proc.get("runtime_seconds", 0) or 0
+        if runtime < _STALL_THRESHOLD_SECONDS:
+            continue
+
+        log_path = proc.get("log_path")
+        if not log_path:
+            continue
+
+        try:
+            mtime = Path(log_path).stat().st_mtime
+            log_age = now - mtime
+            if log_age >= _STALL_THRESHOLD_SECONDS:
+                stalled.append({
+                    "alias": proc.get("alias", "unknown"),
+                    "pid": proc.get("pid"),
+                    "runtime_seconds": runtime,
+                    "log_idle_seconds": log_age,
+                })
+        except OSError:
+            pass
+
+    return stalled
+
+
+def _check_stdin_blocked(running_procs: list[dict]) -> list[dict]:
+    """Detect Kira-launched processes that may be blocked waiting for stdin.
+
+    Uses psutil to check whether a process is in the 'stopped' state or
+    has an open stdin pipe with no recent stdout. This is a best-effort
+    heuristic — false positives are tolerable since screen_vision will
+    confirm before notifying.
+
+    Args:
+        running_procs: List of process dicts from process_registry.
+
+    Returns:
+        List of possibly-blocked process dicts.
+    """
+    blocked: list[dict] = []
+
+    try:
+        import psutil
+    except ImportError:
+        return blocked
+
+    for proc in running_procs:
+        if proc.get("returncode") is not None:
+            continue
+        pid = proc.get("pid")
+        if not pid:
+            continue
+        try:
+            ps = psutil.Process(pid)
+            status = ps.status()
+            if status in (psutil.STATUS_STOPPED, "stopped"):
+                blocked.append({
+                    "alias": proc.get("alias", "unknown"),
+                    "pid": pid,
+                    "status": status,
+                })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    return blocked
+
+
+async def _dispatch_triggers() -> None:
+    """Fire screen-vision checks for any active ambiguity triggers."""
+    triggers = get_pending_triggers()
+    if not triggers:
+        return
+
+    from bot import screen_vision
+
+    snapshot = _raw_snapshot_cache
+
+    for trigger in triggers:
+        process_label = ""
+        if trigger in ("process_frozen", "cursor_ai_stalled"):
+            stalled = snapshot.get("stalled_processes", [])
+            if stalled:
+                process_label = stalled[0].get("alias", "")
+        elif trigger == "stdin_silent":
+            blocked = snapshot.get("stdin_blocked_processes", [])
+            if blocked:
+                process_label = blocked[0].get("alias", "")
+        elif trigger == "dialog_appeared":
+            process_label = snapshot.get("dialog_detected", "") or ""
+
+        try:
+            await screen_vision.notify_if_actionable(trigger, process_label)
+        except Exception as exc:
+            logger.warning("Screen vision dispatch failed for %s: %s", trigger, exc)
+
+
 # ── Formatters ────────────────────────────────────────────────────
 
 def _format_recent_files(data: dict[str, list[str]]) -> str:
@@ -280,6 +769,203 @@ def _format_log_tails(tails: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
+# ── Active project detection ──────────────────────────────────────
+
+import re as _re
+
+# VSCode window title patterns (covers most common variants):
+#   "file.py — folder — Visual Studio Code"
+#   "● file.py — folder — Visual Studio Code"
+#   "folder — Visual Studio Code"
+_VSCODE_TITLE_RE = _re.compile(
+    r"^●?\s*(?:.+?\s+—\s+)?(.+?)\s+—\s+Visual Studio Code",
+    _re.IGNORECASE,
+)
+
+
+def _parse_project_from_title(title: str) -> Path | None:
+    """Extract a matching project root from a window title."""
+    m = _VSCODE_TITLE_RE.match(title)
+    if not m:
+        return None
+
+    folder_hint = m.group(1).strip()
+    roots = _get_project_roots()
+
+    # Try exact subfolder match first, then name-contains match
+    for root in roots:
+        try:
+            for candidate in [root, *root.iterdir()]:
+                if candidate.is_dir() and candidate.name.lower() == folder_hint.lower():
+                    return candidate
+        except OSError:
+            pass
+
+    # Fallback: check if any root name appears in the hint
+    for root in roots:
+        if root.name.lower() in folder_hint.lower():
+            return root
+
+    return None
+
+
+def _build_project_summary(folder: Path) -> str:
+    """Build a compact context string for a project folder."""
+    lines: list[str] = [f"Active project: {folder.name} ({folder})"]
+
+    # Recent git log
+    try:
+        log = subprocess.run(
+            ["git", "-C", str(folder), "log", "--oneline", "-5"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        branch = subprocess.run(
+            ["git", "-C", str(folder), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        if branch:
+            lines.append(f"Branch: {branch}")
+        if log:
+            lines.append(f"Recent commits:\n{log}")
+    except Exception:
+        pass
+
+    # Recent modified files (last 6h)
+    try:
+        cutoff = datetime.now() - timedelta(hours=6)
+        _TRACK_EXTS = {".py", ".ipynb", ".yaml", ".yml", ".toml", ".json", ".md"}
+        _SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules"}
+        recent: list[str] = []
+        for p in folder.rglob("*"):
+            if not p.is_file():
+                continue
+            if any(part in _SKIP_DIRS for part in p.parts):
+                continue
+            if p.suffix.lower() not in _TRACK_EXTS:
+                continue
+            try:
+                if datetime.fromtimestamp(p.stat().st_mtime) >= cutoff:
+                    recent.append(str(p.relative_to(folder)))
+            except OSError:
+                continue
+            if len(recent) >= 10:
+                break
+        if recent:
+            lines.append("Recently modified:\n" + "\n".join(f"  {f}" for f in recent))
+    except Exception:
+        pass
+
+    # context.md if present
+    ctx_file = folder / "context.md"
+    if ctx_file.exists():
+        try:
+            text = ctx_file.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                lines.append(f"Project context:\n{text[:800]}")
+        except OSError:
+            pass
+
+    return "\n".join(lines)
+
+
+async def _refresh_active_project_context(title: str) -> None:
+    """Detect active project from window title and update the context cache."""
+    global _last_foreground_title, _active_project_context, _last_active_folder
+
+    if title == _last_foreground_title:
+        return
+    _last_foreground_title = title
+
+    folder = await asyncio.to_thread(_parse_project_from_title, title)
+    if folder is None:
+        _active_project_context = ""
+        return
+
+    folder_key = str(folder)
+    is_new_project = folder_key != _last_active_folder
+
+    if folder_key in _project_context_cache:
+        _active_project_context = _project_context_cache[folder_key]
+    else:
+        summary = await asyncio.to_thread(_build_project_summary, folder)
+        _project_context_cache[folder_key] = summary
+        _active_project_context = summary
+        logger.info("Active project context loaded: %s", folder.name)
+
+    if is_new_project:
+        _last_active_folder = folder_key
+        if _project_switch_callback is not None:
+            try:
+                result = _project_switch_callback(_active_project_context)
+                if asyncio.iscoroutine(result):
+                    asyncio.ensure_future(result)
+            except Exception as exc:
+                logger.debug("Project switch callback failed: %s", exc)
+
+
+# ── Proactive notification ────────────────────────────────────────
+
+_prev_summary: str = ""
+
+
+async def _maybe_proactive_notify(current_summary: str) -> None:
+    """Ask GPT if the new observer summary is notable enough to ping the user.
+
+    Only fires during autonomous mode. Compares against the previous summary
+    so repeated identical state doesn't keep pinging.
+    """
+    global _prev_summary
+
+    from bot import mode as kira_mode
+
+    if not kira_mode.is_autonomous():
+        _prev_summary = current_summary
+        return
+
+    if not current_summary or current_summary == _prev_summary:
+        return
+
+    prev = _prev_summary
+    _prev_summary = current_summary
+
+    if not prev:
+        return  # First cycle — no baseline to compare against
+
+    try:
+        response = await provider.create_chat_completion(
+            role="fast",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are deciding whether to interrupt a user who is away from their computer. "
+                        "You will be shown a before/after snapshot of their machine state. "
+                        "Reply with ONLY 'yes' if something genuinely notable changed that warrants interrupting them "
+                        "(e.g. a process crashed, a new unexpected file appeared, a long-running task finished, a git conflict). "
+                        "Reply with ONLY 'no' if the change is routine or unimportant. "
+                        "No explanation. One word."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"Before:\n{prev}\n\nAfter:\n{current_summary}",
+                },
+            ],
+            max_tokens=5,
+            temperature=0.0,
+        )
+        verdict = response.choices[0].message.content.strip().lower()
+        logger.debug("Proactive notify verdict: %r", verdict)
+
+        if verdict.startswith("yes"):
+            from bot import notifier
+            _absence_log.append(f"Observer noticed: {current_summary[:200]}")
+            await notifier.send(f"Kira (proactive): {current_summary[:800]}")
+
+    except Exception as exc:
+        logger.debug("Proactive notify check failed: %s", exc)
+
+
 # ── GPT summarisation ─────────────────────────────────────────────
 
 async def _summarise_snapshot(snapshot: dict[str, Any]) -> str:
@@ -294,16 +980,9 @@ async def _summarise_snapshot(snapshot: dict[str, Any]) -> str:
         snapshot.get("screen_summary", ""),
     ]))
 
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        return raw_text
-
     try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=api_key)
-
-        response = await client.chat.completions.create(
-            model=_GPT_MODEL,
+        response = await provider.create_chat_completion(
+            role="fast",
             messages=[
                 {
                     "role": "system",
@@ -325,6 +1004,8 @@ async def _summarise_snapshot(snapshot: dict[str, Any]) -> str:
 
         return response.choices[0].message.content.strip()
 
+    except RuntimeError:
+        return raw_text
     except Exception as exc:
         logger.warning("Observer GPT summarisation failed, using raw snapshot: %s", exc)
         return raw_text

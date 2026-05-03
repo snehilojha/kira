@@ -1,110 +1,321 @@
-"""bot/voice.py — Voice I/O for Kira.
+"""Voice I/O for Kira.
 
 Two responsibilities:
-  1. transcribe(ogg_bytes) → str
-     Sends raw Telegram voice bytes to OpenAI Whisper and returns transcript.
+1. ``transcribe(ogg_bytes) -> str``
+2. ``synthesise(text) -> bytes``  (full buffer — ElevenLabs + fallback)
+3. ``synthesise_stream(text)``    (async generator of PCM chunks — OpenAI primary)
 
-  2. synthesise(text) → bytes
-     Converts a text string to MP3 audio via OpenAI TTS (tts-1).
-
-Design decisions:
-  - Uses the same AsyncOpenAI client and API key as the rest of the bot.
-    No new dependencies — openai>=1.0.0 already covers Whisper and TTS.
-  - TTS model is "tts-1" not "tts-1-hd". tts-1-hd sounds slightly better
-    but has ~2x latency. For a real-time assistant feel, latency wins.
-  - Voice is "alloy" by default. Override with KIRA_VOICE in .env.
-    Options: alloy | echo | fable | onyx | nova | shimmer
-  - All temp files are written to the system temp dir and deleted immediately
-    after use regardless of success or failure. Audio never sits on disk.
-  - Whisper accepts .ogg (Opus) natively — no conversion needed. Telegram
-    voice messages are always Opus-encoded .ogg files.
-  - We don't cache the AsyncOpenAI client at module level because .env may
-    not be loaded yet at import time. Client is created lazily per call.
+Primary provider: ElevenLabs (if ELEVENLABS_API_KEY is set).
+Fallback: OpenAI gpt-4o-mini-tts / gpt-4o-transcribe.
 """
+
+from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
+from typing import AsyncIterator
 
-from openai import AsyncOpenAI
+from bot import provider
 
 logger = logging.getLogger(__name__)
 
-# TTS voice character. Override via KIRA_VOICE env var.
-# Options: alloy | echo | fable | onyx | nova | shimmer
-_VOICE = os.getenv("KIRA_VOICE", "onyx")
+_EMOTION_TAG_RE = re.compile(r"<(?:laugh|chuckle|sigh|gasp|yawn|cough|sob)>", re.IGNORECASE)
+
+# PCM stream parameters (OpenAI pcm format)
+PCM_SAMPLE_RATE = 24_000
+PCM_CHANNELS    = 1
+
+# Abbreviations expanded to spoken form
+_ABBREV = {
+    "e.g.": "for example",
+    "i.e.": "that is",
+    "vs.":  "versus",
+    "vs":   "versus",
+    "etc.": "et cetera",
+    "approx.": "approximately",
+    "approx": "approximately",
+    "min.": "minutes",
+    "sec.": "seconds",
+    "ms":   "milliseconds",
+    "kb":   "kilobytes",
+    "mb":   "megabytes",
+    "gb":   "gigabytes",
+    "tb":   "terabytes",
+    "cpu":  "C P U",
+    "gpu":  "G P U",
+    "ram":  "R A M",
+    "api":  "A P I",
+    "url":  "U R L",
+    "cli":  "C L I",
+    "ui":   "U I",
+    "llm":  "L L M",
+    "ai":   "A I",
+    "ml":   "M L",
+}
+
+_ABBREV_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(k) for k in _ABBREV) + r')\b',
+    re.IGNORECASE,
+)
 
 
-def _get_client() -> AsyncOpenAI:
-    """Return an AsyncOpenAI client from the environment key."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY not set in .env")
-    return AsyncOpenAI(api_key=api_key)
+def _supports_emotion_tags() -> bool:
+    model = (os.getenv("KIRA_TTS_MODEL") or os.getenv("KIRA_VOICE_SYNTHESISE_MODEL", "")).lower()
+    return "orpheus" in model
 
 
-async def transcribe(ogg_bytes: bytes) -> str:
-    """Send raw .ogg bytes to Whisper and return the transcript.
+def _tts_format() -> str:
+    model = (os.getenv("KIRA_TTS_MODEL") or os.getenv("KIRA_VOICE_SYNTHESISE_MODEL", "")).lower()
+    if "orpheus" in model or os.getenv("KIRA_TTS_BASE_URL", ""):
+        return "mp3"
+    return "wav"
 
-    Args:
-        ogg_bytes: Raw bytes of a Telegram voice message (.ogg / Opus).
 
-    Returns:
-        Transcribed text string. Empty string if Whisper returns nothing.
+def _format_for_speech(text: str) -> str:
+    """Convert LLM output to natural spoken form before sending to TTS."""
+    # Strip markdown formatting
+    text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)
+    text = re.sub(r'`{1,3}[^`]*`{1,3}', lambda m: m.group(0).strip('`'), text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r'^[-*•]\s+', '', text, flags=re.MULTILINE)
 
-    Raises:
-        RuntimeError: If OPENAI_API_KEY is not set.
-        openai.OpenAIError: On API errors.
-    """
-    client = _get_client()
+    # Numbers and units
+    text = re.sub(r'(\d+(?:\.\d+)?)\s*%', lambda m: f"{m.group(1)} percent", text)
+    text = re.sub(r'\$(\d+(?:,\d{3})*(?:\.\d+)?)', lambda m: f"{m.group(1)} dollars", text)
+    text = re.sub(r'(\d+(?:\.\d+)?)\s*x\b', lambda m: f"{m.group(1)} times", text)
 
-    # Write to a named temp file — the OpenAI SDK needs a file-like object
-    # with a .name that includes the extension to determine the audio format.
-    with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-        tmp.write(ogg_bytes)
+    # Expand abbreviations
+    def _expand(m: re.Match) -> str:
+        return _ABBREV[m.group(0).lower()]
+    text = _ABBREV_RE.sub(_expand, text)
+
+    # Collapse excess whitespace / blank lines
+    text = re.sub(r'\n{2,}', '. ', text)
+    text = re.sub(r'\n', ' ', text)
+    text = re.sub(r'  +', ' ', text)
+
+    return text.strip()
+
+
+def _prepare_text(text: str) -> str:
+    if _supports_emotion_tags():
+        return text
+    text = _format_for_speech(text)
+    return _EMOTION_TAG_RE.sub("", text).strip()
+
+
+def _get_voice_name() -> str:
+    return os.getenv("KIRA_VOICE", "nova")
+
+
+def _elevenlabs_api_key() -> str | None:
+    return os.getenv("ELEVENLABS_API_KEY") or None
+
+
+# ── ElevenLabs TTS ────────────────────────────────────────────────
+
+async def _synthesise_elevenlabs(text: str) -> tuple[bytes, str]:
+    import asyncio
+    from elevenlabs.client import ElevenLabs
+
+    api_key = _elevenlabs_api_key()
+    voice_id = os.getenv("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")  # default: George
+    model_id = os.getenv("ELEVENLABS_TTS_MODEL", "eleven_flash_v2_5")
+
+    client = ElevenLabs(api_key=api_key)
+
+    def _call() -> bytes:
+        audio_iter = client.text_to_speech.convert(
+            voice_id=voice_id,
+            text=_prepare_text(text),
+            model_id=model_id,
+            output_format="mp3_44100_128",
+        )
+        return b"".join(audio_iter)
+
+    audio_bytes = await asyncio.get_event_loop().run_in_executor(None, _call)
+    logger.info("ElevenLabs TTS synthesised %d bytes for %d chars", len(audio_bytes), len(text))
+    return audio_bytes, "mp3"
+
+
+# ── ElevenLabs STT ────────────────────────────────────────────────
+
+async def _transcribe_elevenlabs(audio_bytes: bytes, suffix: str) -> str:
+    import asyncio
+    from elevenlabs.client import ElevenLabs
+
+    api_key = _elevenlabs_api_key()
+    model_id = os.getenv("ELEVENLABS_STT_MODEL", "scribe_v1")
+
+    client = ElevenLabs(api_key=api_key)
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes)
         tmp_path = Path(tmp.name)
 
     try:
-        with open(tmp_path, "rb") as audio_file:
-            response = await client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                language="en",  # Explicit language = faster + more accurate.
-                                # Remove this line for auto-detection.
-            )
-        transcript = response.text.strip()
-        logger.info("Whisper transcript: %r", transcript)
+        def _call() -> str:
+            with open(tmp_path, "rb") as f:
+                result = client.speech_to_text.convert(
+                    file=f,
+                    model_id=model_id,
+                    language_code="en",
+                )
+            return result.text.strip()
+
+        transcript = await asyncio.get_event_loop().run_in_executor(None, _call)
+        logger.info("ElevenLabs STT transcript: %r", transcript)
         return transcript
     finally:
-        # Always clean up — even if the API call throws.
         tmp_path.unlink(missing_ok=True)
 
 
-async def synthesise(text: str) -> bytes:
-    """Convert text to MP3 bytes via OpenAI TTS.
+# ── OpenAI fallback TTS (full buffer) ────────────────────────────
 
-    Args:
-        text: The text Kira should speak.
-
-    Returns:
-        Raw MP3 bytes ready to send as a Telegram voice message.
-
-    Raises:
-        RuntimeError: If OPENAI_API_KEY is not set.
-        openai.OpenAIError: On API errors.
-    """
-    client = _get_client()
-
-    response = await client.audio.speech.create(
-        model="tts-1",
-        voice=_VOICE,
-        input=text,
+async def _synthesise_openai_fallback(text: str) -> tuple[bytes, str]:
+    from openai import AsyncOpenAI
+    fallback_client = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+    fallback_model = os.environ.get("KIRA_TTS_FALLBACK_MODEL", "gpt-4o-mini-tts")
+    fallback_voice = os.environ.get("KIRA_TTS_FALLBACK_VOICE", "nova")
+    fallback_instructions = os.environ.get(
+        "KIRA_TTS_FALLBACK_INSTRUCTIONS",
+        "Speak as Kira, a calm, intelligent, and warm personal AI assistant. "
+        "Natural pace, slightly warm tone. Never robotic or overly chipper.",
+    )
+    kwargs: dict = dict(
+        model=fallback_model,
+        voice=fallback_voice,
+        input=_prepare_text(text),
         response_format="mp3",
     )
-
+    if "mini-tts" in fallback_model or "4o" in fallback_model:
+        kwargs["instructions"] = fallback_instructions
+    response = await fallback_client.audio.speech.create(**kwargs)
     audio_bytes = response.read()
-    logger.info(
-        "TTS synthesised %d bytes for %d chars", len(audio_bytes), len(text)
+    logger.info("OpenAI fallback TTS synthesised %d bytes", len(audio_bytes))
+    return audio_bytes, "mp3"
+
+
+# ── OpenAI streaming TTS ──────────────────────────────────────────
+
+async def _stream_openai_pcm(text: str) -> AsyncIterator[bytes]:
+    """Stream raw PCM chunks from OpenAI TTS (24kHz, mono, int16)."""
+    from openai import AsyncOpenAI
+    tts = provider.load_tts_config()
+    client = AsyncOpenAI(
+        api_key=os.environ.get("KIRA_TTS_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+        base_url=os.environ.get("KIRA_TTS_BASE_URL") or None,
     )
-    return audio_bytes
+    instructions = os.environ.get("KIRA_TTS_INSTRUCTIONS")
+    kwargs: dict = dict(
+        model=tts.model,
+        voice=_get_voice_name(),
+        input=_prepare_text(text),
+        response_format="pcm",
+    )
+    if instructions and ("mini-tts" in tts.model or "4o" in tts.model):
+        kwargs["instructions"] = instructions
+
+    async with client.audio.speech.with_streaming_response.create(**kwargs) as response:
+        async for chunk in response.iter_bytes(chunk_size=4096):
+            if chunk:
+                yield chunk
+
+
+# ── Public API ────────────────────────────────────────────────────
+
+async def transcribe(audio_bytes: bytes, suffix: str = ".ogg") -> str:
+    """Transcribe audio. Uses ElevenLabs Scribe if configured, falls back to OpenAI."""
+    if _elevenlabs_api_key():
+        try:
+            return await _transcribe_elevenlabs(audio_bytes, suffix)
+        except Exception as exc:
+            logger.warning("ElevenLabs STT failed (%s) — falling back to OpenAI", exc)
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = Path(tmp.name)
+    try:
+        with open(tmp_path, "rb") as audio_file:
+            response = await provider.transcribe_audio(file=audio_file, language="en")
+        transcript = response.text.strip()
+        logger.info("OpenAI STT transcript: %r", transcript)
+        return transcript
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+async def synthesise(text: str, response_format: str | None = None) -> tuple[bytes, str]:
+    """Convert text to speech (full buffer). Used by ElevenLabs path and Telegram voice."""
+    if _elevenlabs_api_key():
+        try:
+            return await _synthesise_elevenlabs(text)
+        except Exception as exc:
+            logger.warning("ElevenLabs TTS failed (%s) — falling back to OpenAI", exc)
+
+    fmt = response_format or _tts_format()
+    try:
+        response = await provider.synthesise_speech(
+            text=_prepare_text(text),
+            voice=_get_voice_name(),
+            response_format=fmt,
+        )
+        audio_bytes = response.read()
+        logger.info("OpenAI TTS synthesised %d bytes for %d chars (fmt=%s)", len(audio_bytes), len(text), fmt)
+        return audio_bytes, fmt
+    except Exception as primary_exc:
+        logger.warning("OpenAI TTS failed (%s) — trying fallback model", primary_exc)
+        try:
+            audio_bytes, fmt = await _synthesise_openai_fallback(text)
+            return audio_bytes, fmt
+        except Exception:
+            logger.error("All TTS providers failed: %s", primary_exc)
+            raise primary_exc
+
+
+async def synthesise_stream(text: str) -> AsyncIterator[bytes]:
+    """Stream PCM audio chunks. Falls back to full synthesise() on ElevenLabs or error.
+
+    Yields raw signed 16-bit PCM at PCM_SAMPLE_RATE Hz, PCM_CHANNELS channel(s).
+    On fallback (ElevenLabs active or streaming error), yields a single MP3/WAV chunk
+    so the caller can detect format via the 'fmt' side-channel — callers should check
+    whether ElevenLabs is active and use synthesise() directly in that case.
+    """
+    if _elevenlabs_api_key():
+        # ElevenLabs doesn't stream PCM — return full bytes as single chunk
+        audio_bytes, _ = await _synthesise_elevenlabs(text)
+        yield audio_bytes
+        return
+
+    try:
+        async for chunk in _stream_openai_pcm(text):
+            yield chunk
+    except Exception as exc:
+        logger.warning("OpenAI PCM stream failed (%s) — falling back to full synthesis", exc)
+        try:
+            audio_bytes, fmt = await _synthesise_openai_fallback(text)
+            yield audio_bytes
+        except Exception as fallback_exc:
+            logger.error("All TTS providers failed: %s", fallback_exc)
+            raise fallback_exc
+
+
+def mp3_to_wav_bytes(mp3_bytes: bytes) -> bytes:
+    """Decode mp3 bytes to WAV bytes using ffmpeg subprocess."""
+    import shutil
+    import subprocess
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found on PATH — cannot convert MP3 to WAV")
+    result = subprocess.run(
+        [ffmpeg, "-y", "-f", "mp3", "-i", "pipe:0", "-f", "wav", "pipe:1"],
+        input=mp3_bytes,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg mp3→wav failed: {result.stderr.decode()[-300:]}")
+    return result.stdout

@@ -1,0 +1,23 @@
+[apps.chrome]
+open = "chrome"
+close = ["chrome.exe"]
+
+[apps.vscode]
+open = "code D:/VS_adv_python/kira"
+close = ["Code.exe"]
+
+[apps.claude]
+open = "claude"
+close = ["Claude.exe"]
+
+[modes.work]
+aliases = ["work mode", "start work", "coding mode", "wake up"]
+open = ["vscode", "chrome", "claude"]
+close = []
+say = "Your workstation is primed, Sir."
+
+[modes.relax]
+aliases = ["relax mode", "chill mode","fun time"]
+open = ["chrome"]
+close = ["vscode", "claude"]
+say = "Good work, sir. Have a nice day."
