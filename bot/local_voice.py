@@ -1005,7 +1005,8 @@ async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
     # otherwise fall back to the last captured user window.
     target_hwnd = _find_hwnd_from_transcript(transcript) or _last_user_hwnd
     await asyncio.to_thread(_restore_foreground, target_hwnd)
-    await asyncio.sleep(0.5)  # let the OS actually switch before grabbing screen
+    if target_hwnd:
+        await asyncio.sleep(0.3)  # let the OS switch before grabbing screen
 
     # Take a screenshot so the LLM can see what's on screen
     try:
@@ -1101,6 +1102,31 @@ async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
         {
             "type": "function",
             "function": {
+                "name": "drag",
+                "description": "Click and drag from one screen coordinate to another.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "x1": {"type": "integer", "description": "Start X"},
+                        "y1": {"type": "integer", "description": "Start Y"},
+                        "x2": {"type": "integer", "description": "End X"},
+                        "y2": {"type": "integer", "description": "End Y"},
+                    },
+                    "required": ["x1", "y1", "x2", "y2"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_screen",
+                "description": "Take a fresh screenshot to see the current state of the screen before deciding what to do next.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "task_complete",
                 "description": "Call this when the task is fully done and no more actions are needed.",
                 "parameters": {"type": "object", "properties": {}, "required": []},
@@ -1118,7 +1144,7 @@ async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
     if screenshot_b64:
         user_content.insert(0, {
             "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "low"},
+            "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "auto"},
         })
 
     messages = [
@@ -1191,7 +1217,7 @@ async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
 
                 elif name == "type_text":
                     text = args["text"]
-                    await asyncio.to_thread(_pag.typewrite, text, interval=0.05)
+                    await asyncio.to_thread(_pag.typewrite, text, interval=0.02)
                     actions_taken.append(f"typed {len(text)} chars")
 
                 elif name == "press_key":
@@ -1204,6 +1230,30 @@ async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
                     await asyncio.to_thread(_pag.hotkey, *keys)
                     actions_taken.append(f"hotkey {'+'.join(keys)}")
 
+                elif name == "drag":
+                    x1, y1 = args["x1"], args["y1"]
+                    x2, y2 = args["x2"], args["y2"]
+                    await asyncio.to_thread(_pag.moveTo, x1, y1)
+                    await asyncio.to_thread(_pag.dragTo, x2, y2, duration=0.3)
+                    actions_taken.append(f"dragged ({x1},{y1})→({x2},{y2})")
+
+                elif name == "read_screen":
+                    try:
+                        fresh_png = await asyncio.to_thread(_get_screenshot_png)
+                        fresh_b64 = _base64.b64encode(fresh_png).decode()
+                        tool_result = "screenshot attached"
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": [
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{fresh_b64}", "detail": "auto"}},
+                                {"type": "text", "text": "Current screen state."},
+                            ],
+                        })
+                        continue
+                    except Exception:
+                        tool_result = "screenshot failed"
+
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -1212,7 +1262,8 @@ async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
 
             # After all tool calls in this round, wait for UI to settle
             # then send a fresh screenshot so next round sees updated state
-            await asyncio.sleep(0.8)
+            had_click = any(a.startswith("clicked") for a in actions_taken)
+            await asyncio.sleep(0.5 if had_click else 0.2)
             try:
                 new_png = await asyncio.to_thread(_get_screenshot_png)
                 if new_png:
@@ -1220,7 +1271,7 @@ async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
                     messages.append({
                         "role": "user",
                         "content": [
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{new_b64}", "detail": "low"}},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{new_b64}", "detail": "auto"}},
                             {"type": "text", "text": "Here is the current screen state. Continue if needed, or stop if the task is complete."},
                         ],
                     })
