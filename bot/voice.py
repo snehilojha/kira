@@ -2,7 +2,8 @@
 
 Two responsibilities:
 1. ``transcribe(ogg_bytes) -> str``
-2. ``synthesise(text) -> bytes``
+2. ``synthesise(text) -> bytes``  (full buffer — ElevenLabs + fallback)
+3. ``synthesise_stream(text)``    (async generator of PCM chunks — OpenAI primary)
 
 Primary provider: ElevenLabs (if ELEVENLABS_API_KEY is set).
 Fallback: OpenAI gpt-4o-mini-tts / gpt-4o-transcribe.
@@ -15,12 +16,50 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from typing import AsyncIterator
 
 from bot import provider
 
 logger = logging.getLogger(__name__)
 
 _EMOTION_TAG_RE = re.compile(r"<(?:laugh|chuckle|sigh|gasp|yawn|cough|sob)>", re.IGNORECASE)
+
+# PCM stream parameters (OpenAI pcm format)
+PCM_SAMPLE_RATE = 24_000
+PCM_CHANNELS    = 1
+
+# Abbreviations expanded to spoken form
+_ABBREV = {
+    "e.g.": "for example",
+    "i.e.": "that is",
+    "vs.":  "versus",
+    "vs":   "versus",
+    "etc.": "et cetera",
+    "approx.": "approximately",
+    "approx": "approximately",
+    "min.": "minutes",
+    "sec.": "seconds",
+    "ms":   "milliseconds",
+    "kb":   "kilobytes",
+    "mb":   "megabytes",
+    "gb":   "gigabytes",
+    "tb":   "terabytes",
+    "cpu":  "C P U",
+    "gpu":  "G P U",
+    "ram":  "R A M",
+    "api":  "A P I",
+    "url":  "U R L",
+    "cli":  "C L I",
+    "ui":   "U I",
+    "llm":  "L L M",
+    "ai":   "A I",
+    "ml":   "M L",
+}
+
+_ABBREV_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(k) for k in _ABBREV) + r')\b',
+    re.IGNORECASE,
+)
 
 
 def _supports_emotion_tags() -> bool:
@@ -35,9 +74,37 @@ def _tts_format() -> str:
     return "wav"
 
 
+def _format_for_speech(text: str) -> str:
+    """Convert LLM output to natural spoken form before sending to TTS."""
+    # Strip markdown formatting
+    text = re.sub(r'\*{1,2}([^*]+)\*{1,2}', r'\1', text)
+    text = re.sub(r'`{1,3}[^`]*`{1,3}', lambda m: m.group(0).strip('`'), text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r'^[-*•]\s+', '', text, flags=re.MULTILINE)
+
+    # Numbers and units
+    text = re.sub(r'(\d+(?:\.\d+)?)\s*%', lambda m: f"{m.group(1)} percent", text)
+    text = re.sub(r'\$(\d+(?:,\d{3})*(?:\.\d+)?)', lambda m: f"{m.group(1)} dollars", text)
+    text = re.sub(r'(\d+(?:\.\d+)?)\s*x\b', lambda m: f"{m.group(1)} times", text)
+
+    # Expand abbreviations
+    def _expand(m: re.Match) -> str:
+        return _ABBREV[m.group(0).lower()]
+    text = _ABBREV_RE.sub(_expand, text)
+
+    # Collapse excess whitespace / blank lines
+    text = re.sub(r'\n{2,}', '. ', text)
+    text = re.sub(r'\n', ' ', text)
+    text = re.sub(r'  +', ' ', text)
+
+    return text.strip()
+
+
 def _prepare_text(text: str) -> str:
     if _supports_emotion_tags():
         return text
+    text = _format_for_speech(text)
     return _EMOTION_TAG_RE.sub("", text).strip()
 
 
@@ -61,7 +128,6 @@ async def _synthesise_elevenlabs(text: str) -> tuple[bytes, str]:
 
     client = ElevenLabs(api_key=api_key)
 
-    # ElevenLabs SDK is sync — run in executor to avoid blocking event loop
     def _call() -> bytes:
         audio_iter = client.text_to_speech.convert(
             voice_id=voice_id,
@@ -108,7 +174,7 @@ async def _transcribe_elevenlabs(audio_bytes: bytes, suffix: str) -> str:
         tmp_path.unlink(missing_ok=True)
 
 
-# ── OpenAI fallback TTS ───────────────────────────────────────────
+# ── OpenAI fallback TTS (full buffer) ────────────────────────────
 
 async def _synthesise_openai_fallback(text: str) -> tuple[bytes, str]:
     from openai import AsyncOpenAI
@@ -132,6 +198,32 @@ async def _synthesise_openai_fallback(text: str) -> tuple[bytes, str]:
     audio_bytes = response.read()
     logger.info("OpenAI fallback TTS synthesised %d bytes", len(audio_bytes))
     return audio_bytes, "mp3"
+
+
+# ── OpenAI streaming TTS ──────────────────────────────────────────
+
+async def _stream_openai_pcm(text: str) -> AsyncIterator[bytes]:
+    """Stream raw PCM chunks from OpenAI TTS (24kHz, mono, int16)."""
+    from openai import AsyncOpenAI
+    tts = provider.load_tts_config()
+    client = AsyncOpenAI(
+        api_key=os.environ.get("KIRA_TTS_API_KEY") or os.environ.get("OPENAI_API_KEY"),
+        base_url=os.environ.get("KIRA_TTS_BASE_URL") or None,
+    )
+    instructions = os.environ.get("KIRA_TTS_INSTRUCTIONS")
+    kwargs: dict = dict(
+        model=tts.model,
+        voice=_get_voice_name(),
+        input=_prepare_text(text),
+        response_format="pcm",
+    )
+    if instructions and ("mini-tts" in tts.model or "4o" in tts.model):
+        kwargs["instructions"] = instructions
+
+    async with client.audio.speech.with_streaming_response.create(**kwargs) as response:
+        async for chunk in response.iter_bytes(chunk_size=4096):
+            if chunk:
+                yield chunk
 
 
 # ── Public API ────────────────────────────────────────────────────
@@ -158,7 +250,7 @@ async def transcribe(audio_bytes: bytes, suffix: str = ".ogg") -> str:
 
 
 async def synthesise(text: str, response_format: str | None = None) -> tuple[bytes, str]:
-    """Convert text to speech. Uses ElevenLabs if configured, falls back to OpenAI."""
+    """Convert text to speech (full buffer). Used by ElevenLabs path and Telegram voice."""
     if _elevenlabs_api_key():
         try:
             return await _synthesise_elevenlabs(text)
@@ -180,9 +272,36 @@ async def synthesise(text: str, response_format: str | None = None) -> tuple[byt
         try:
             audio_bytes, fmt = await _synthesise_openai_fallback(text)
             return audio_bytes, fmt
+        except Exception:
+            logger.error("All TTS providers failed: %s", primary_exc)
+            raise primary_exc
+
+
+async def synthesise_stream(text: str) -> AsyncIterator[bytes]:
+    """Stream PCM audio chunks. Falls back to full synthesise() on ElevenLabs or error.
+
+    Yields raw signed 16-bit PCM at PCM_SAMPLE_RATE Hz, PCM_CHANNELS channel(s).
+    On fallback (ElevenLabs active or streaming error), yields a single MP3/WAV chunk
+    so the caller can detect format via the 'fmt' side-channel — callers should check
+    whether ElevenLabs is active and use synthesise() directly in that case.
+    """
+    if _elevenlabs_api_key():
+        # ElevenLabs doesn't stream PCM — return full bytes as single chunk
+        audio_bytes, _ = await _synthesise_elevenlabs(text)
+        yield audio_bytes
+        return
+
+    try:
+        async for chunk in _stream_openai_pcm(text):
+            yield chunk
+    except Exception as exc:
+        logger.warning("OpenAI PCM stream failed (%s) — falling back to full synthesis", exc)
+        try:
+            audio_bytes, fmt = await _synthesise_openai_fallback(text)
+            yield audio_bytes
         except Exception as fallback_exc:
             logger.error("All TTS providers failed: %s", fallback_exc)
-            raise primary_exc
+            raise fallback_exc
 
 
 def mp3_to_wav_bytes(mp3_bytes: bytes) -> bytes:

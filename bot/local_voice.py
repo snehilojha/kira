@@ -1728,14 +1728,131 @@ def play_wav_bytes(audio_bytes: bytes) -> None:
         done_event.wait()   # block calling thread until audio finishes (not Qt thread)
 
 
+def play_pcm_stream(chunk_iter: "queue.Queue[bytes | None]") -> None:
+    """Play PCM audio from a queue of raw int16 chunks (24kHz mono).
+
+    The producer thread puts bytes chunks into chunk_iter and signals
+    end-of-stream with a None sentinel. Playback starts after a small
+    pre-buffer to guard against network jitter causing stutter.
+    """
+    import numpy as np
+    import sounddevice as sd
+
+    _SAMPLE_RATE  = voice.PCM_SAMPLE_RATE
+    _CHANNELS     = voice.PCM_CHANNELS
+    _PRE_BUFFER_S = 2  # seconds of audio to buffer before starting playback
+    _PRE_BUFFER_B = int(_SAMPLE_RATE * _CHANNELS * 2 * _PRE_BUFFER_S)  # bytes (int16 = 2 bytes)
+
+    _MAX_RMS      = 0.18
+    _AMP_INTERVAL = 0.05
+    _amp_chunk    = int(_SAMPLE_RATE * _AMP_INTERVAL)
+
+    # Accumulate pre-buffer before opening stream
+    pre_buf = b""
+    while len(pre_buf) < _PRE_BUFFER_B:
+        chunk = chunk_iter.get()
+        if chunk is None:
+            break
+        pre_buf += chunk
+
+    if not pre_buf:
+        return
+
+    # Convert pre-buffer to float32 for playback
+    pcm_buf = np.frombuffer(pre_buf, dtype=np.int16).astype(np.float32) / 32768.0
+
+    # Cursor + done event shared with callback
+    cursor     = [0]
+    exhausted  = [False]
+    done_event = threading.Event()
+    buf_lock   = threading.Lock()
+
+    def _producer():
+        nonlocal pcm_buf
+        while True:
+            chunk = chunk_iter.get()
+            if chunk is None:
+                with buf_lock:
+                    exhausted[0] = True
+                return
+            new_samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            with buf_lock:
+                pcm_buf = np.concatenate([pcm_buf, new_samples])
+
+    def _callback(outdata, frames, time_info, status):
+        with buf_lock:
+            start = cursor[0]
+            end   = start + frames
+            chunk = pcm_buf[start:end]
+            buf_exhausted = exhausted[0]
+            buf_len = len(pcm_buf)
+
+        if len(chunk) >= frames:
+            # Normal path — enough buffered audio
+            outdata[:, 0] = chunk
+            with buf_lock:
+                cursor[0] = end
+        elif buf_exhausted and cursor[0] >= buf_len:
+            # Stream finished and cursor has passed the end — stop cleanly
+            outdata[:len(chunk), 0] = chunk
+            outdata[len(chunk):, 0] = 0
+            done_event.set()
+            raise sd.CallbackStop()
+        else:
+            # Producer hasn't caught up yet — output silence, don't advance cursor
+            outdata[:, 0] = 0
+
+    def _push_amplitudes():
+        idx = 0
+        while not done_event.is_set():
+            with buf_lock:
+                sl = pcm_buf[idx * _amp_chunk : (idx + 1) * _amp_chunk]
+            if len(sl):
+                rms = float(np.sqrt(np.mean(sl ** 2)))
+                overlay.push_amplitude(min(rms / _MAX_RMS, 1.0))
+                idx += 1
+            threading.Event().wait(_AMP_INTERVAL)
+        overlay.push_amplitude(0.0)
+
+    producer_thread = threading.Thread(target=_producer, daemon=True)
+    amp_thread      = threading.Thread(target=_push_amplitudes, daemon=True)
+
+    with sd.OutputStream(
+        samplerate=_SAMPLE_RATE,
+        channels=_CHANNELS,
+        dtype="float32",
+        callback=_callback,
+        finished_callback=done_event.set,
+    ):
+        producer_thread.start()
+        amp_thread.start()
+        done_event.wait()
+
+
 async def speak(text: str) -> None:
     """Speak a short local response, falling back to console only on failure."""
     try:
-        audio_bytes, fmt = await voice.synthesise(text)
-        if fmt != "wav":
-            audio_bytes = await asyncio.to_thread(voice.mp3_to_wav_bytes, audio_bytes)
-        # Run blocking playback on a thread pool so the asyncio loop stays free
-        await asyncio.to_thread(play_wav_bytes, audio_bytes)
+        if voice._elevenlabs_api_key():
+            # ElevenLabs returns full MP3 — use existing buffer path
+            audio_bytes, fmt = await voice.synthesise(text)
+            if fmt != "wav":
+                audio_bytes = await asyncio.to_thread(voice.mp3_to_wav_bytes, audio_bytes)
+            await asyncio.to_thread(play_wav_bytes, audio_bytes)
+        else:
+            # OpenAI — stream PCM chunks through a queue to sounddevice
+            import queue as _queue
+            pcm_queue: _queue.Queue[bytes | None] = _queue.Queue()  # unbounded — put never blocks
+
+            async def _feed():
+                try:
+                    async for chunk in voice.synthesise_stream(text):
+                        pcm_queue.put_nowait(chunk)
+                finally:
+                    pcm_queue.put_nowait(None)
+
+            feed_task = asyncio.ensure_future(_feed())
+            await asyncio.to_thread(play_pcm_stream, pcm_queue)
+            await feed_task
     except Exception as exc:
         logger.warning("Local TTS playback failed: %s", exc)
         overlay.set_transcript("", f"[TTS failed] {text}")

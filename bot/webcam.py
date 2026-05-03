@@ -19,6 +19,8 @@ import logging
 import threading
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 # ── Module-level session state ────────────────────────────────────
@@ -85,63 +87,73 @@ def close_session() -> None:
         logger.info("Webcam session closed")
 
 
-def capture_frame_b64() -> str | None:
-    """Grab the current webcam frame and return it as base64 JPEG.
+def capture_frame() -> "tuple[str | None, np.ndarray | None]":
+    """Grab the current webcam frame.
 
-    Returns None if the session is not open or capture fails.
+    Returns (base64_jpeg, bgr_ndarray) or (None, None) on failure.
     """
     with _lock:
         if not _session_open or _cap is None:
-            return None
+            return None, None
         try:
             import cv2
             ret, frame = _cap.read()
             if not ret or frame is None:
-                return None
-            # Encode as JPEG at 85% quality — good balance of size vs detail
+                return None, None
             ret2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ret2:
-                return None
-            return base64.b64encode(buf.tobytes()).decode("ascii")
+                return None, None
+            return base64.b64encode(buf.tobytes()).decode("ascii"), frame
         except Exception as exc:
             logger.warning("Frame capture failed: %s", exc)
-            return None
+            return None, None
+
+
+def capture_frame_b64() -> str | None:
+    """Grab the current webcam frame and return it as base64 JPEG."""
+    b64, _ = capture_frame()
+    return b64
 
 
 async def query(question: str) -> str:
-    """Grab the current frame and ask the vision model the question.
+    """Grab the current frame, run face recognition, ask the vision model."""
+    image_b64, raw_frame = await asyncio.to_thread(capture_frame)
 
-    Args:
-        question: Natural language question about what the camera sees.
-
-    Returns:
-        Vision model's plain-text answer.
-    """
-    image_b64 = await asyncio.to_thread(capture_frame_b64)
-
-    if not image_b64:
+    if not image_b64 or raw_frame is None:
         return "I couldn't grab a frame from the camera. Is the webcam connected?"
 
-    from bot import identity as _identity
-    user_name = _identity.get_user_name()
-    user_facts = _identity.get_all_facts()
+    # Run face recognition to determine who's in frame
+    face_context = ""
+    try:
+        from bot import presence as _presence
+        from bot import identity as _identity
+        enrolled = await asyncio.to_thread(_presence._load_enrolled)
+        if enrolled is not None:
+            result = await asyncio.to_thread(_presence._check_frame, raw_frame, enrolled)
+            logger.info("Webcam face check result: %s", result)
+            user_name = _identity.get_user_name() or "the owner"
+            if result == _presence._CheckResult.OWNER:
+                face_context = f"Face recognition has confirmed the person in this image is {user_name}, the owner. Address them by name in your response. "
+            elif result == _presence._CheckResult.STRANGER:
+                face_context = "Face recognition does NOT recognise this person — they are not the owner. Do not address them as the owner. "
+            elif result == _presence._CheckResult.EMPTY:
+                face_context = "No face was detected in the frame. Do not refer to any person. "
+    except Exception as exc:
+        logger.debug("Face check during webcam query failed: %s", exc)
 
-    identity_context = ""
-    if user_name or user_facts:
-        parts = []
-        if user_name:
-            parts.append(f"The person in front of the camera is {user_name}, the user.")
-        if user_facts:
-            parts.append("What you know about them: " + " ".join(
-                f"{f}." if not f.endswith(".") else f for f in user_facts[:4]
-            ))
-        identity_context = " ".join(parts) + " "
+    from bot import identity as _identity
+    user_facts = _identity.get_all_facts()
+    facts_context = ""
+    if user_facts:
+        facts_context = "What you know about the owner: " + " ".join(
+            f"{f}." if not f.endswith(".") else f for f in user_facts[:4]
+        ) + " "
 
     base_question = question.strip() or (
         "Describe what you see in this image in 2-3 sentences. "
         "Focus on the main subject and any notable details."
     )
-    prompt = identity_context + base_question
+    prompt = face_context + facts_context + base_question
 
     try:
         from bot import provider

@@ -24,6 +24,10 @@ def get_state_dir() -> Path:
     return state_dir
 
 
+_COMPLETED_STATUSES = {"completed", "failed", "interrupted", "cancelled"}
+_PRUNE_KEEP = 10
+
+
 def save_task_state(task_id: str, payload: dict[str, Any]) -> Path:
     """Write the latest operational state for one task."""
     path = _task_state_path(task_id)
@@ -31,7 +35,33 @@ def save_task_state(task_id: str, payload: dict[str, Any]) -> Path:
     serializable.setdefault("task_id", task_id)
     serializable["updated_at"] = _utc_now()
     path.write_text(json.dumps(serializable, indent=2, sort_keys=True), encoding="utf-8")
+    _prune_completed()
     return path
+
+
+def _prune_completed(keep: int = _PRUNE_KEEP) -> None:
+    """Delete oldest completed task files beyond the keep limit."""
+    completed = [
+        p for p in sorted(
+            get_state_dir().glob("*.json"),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        if _is_completed(p)
+    ]
+    for stale in completed[keep:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def _is_completed(path: Path) -> bool:
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        return str(state.get("status", "")) in _COMPLETED_STATUSES
+    except (OSError, json.JSONDecodeError):
+        return False
 
 
 def load_task_state(task_id: str) -> dict[str, Any] | None:
