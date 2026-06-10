@@ -8,7 +8,7 @@ GPUtil
 pyperclip
 mss
 httpx
-openai>=1.0.0
+openai>=1.0.0,<2.0
 aiosqlite
 tiktoken
 sounddevice
@@ -16,3 +16,17 @@ numpy
 keyboard
 yfinance
 opencv-python
+PyQt6
+beautifulsoup4
+pydantic
+rich
+anthropic
+pyyaml
+openwakeword
+pyautogui
+pywin32
+ddgs
+# Presence detection (optional — only if KIRA_PRESENCE_ENABLED=true):
+# insightface
+# Local package — install manually:
+# pip install -e D:/AI_tools/astra/packages/astra-node

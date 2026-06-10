@@ -288,12 +288,29 @@ def _update_process_timers() -> None:
         if pid not in live_pids:
             _low_cpu_since.pop(pid, None)
 
+    # Two-phase CPU sampling: seed all processes, sleep once, then read —
+    # 0.5s total instead of 0.5s per process.
+    handles: dict[int, "psutil.Process"] = {}
+    for proc in watched:
+        pid = proc["pid"]
+        try:
+            ps = psutil.Process(pid)
+            ps.cpu_percent(interval=None)  # seed
+            handles[pid] = ps
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            _low_cpu_since.pop(pid, None)
+            _high_cpu_since.pop(pid, None)
+    if handles:
+        time.sleep(0.5)
+
     for proc in watched:
         pid = proc["pid"]
         runtime = proc["runtime_seconds"]
+        ps = handles.get(pid)
+        if ps is None:
+            continue
         try:
-            ps = psutil.Process(pid)
-            cpu = ps.cpu_percent(interval=0.5)
+            cpu = ps.cpu_percent(interval=None)
             if cpu < 1.0 and runtime > 60:
                 _low_cpu_since.setdefault(pid, time.monotonic())
             else:

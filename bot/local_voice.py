@@ -415,15 +415,15 @@ async def execute_command(
     command = parsed.command.strip().lower()
 
     if command == "/mode_run":
-        result = app_control.run_mode(" ".join(parsed.args), apps_config)
+        result = await asyncio.to_thread(app_control.run_mode, " ".join(parsed.args), apps_config)
         return _from_action_result(result)
 
     if command == "/open":
-        result = app_control.open_app(" ".join(parsed.args), apps_config)
+        result = await asyncio.to_thread(app_control.open_app, " ".join(parsed.args), apps_config)
         return _from_action_result(result)
 
     if command == "/close_apps":
-        result = app_control.close_apps(parsed.args, apps_config)
+        result = await asyncio.to_thread(app_control.close_apps, parsed.args, apps_config)
         return _from_action_result(result)
 
     if command == "/status":
@@ -431,13 +431,13 @@ async def execute_command(
         return LocalVoiceResult(ok=True, message=message, spoken="Status is ready.")
 
     if command == "/sysinfo":
-        message = _format_sysinfo()
+        message = await asyncio.to_thread(_format_sysinfo)
         return LocalVoiceResult(ok=True, message=message, spoken="System info is ready.")
 
     # Restore focus to the user's window before sending input so keystrokes/
     # scroll/clicks land on the right app instead of the Kira terminal.
-    _restore_foreground(_last_user_hwnd)
-    desktop_result = desktop_control.execute_command(parsed.command, parsed.args)
+    await asyncio.to_thread(_restore_foreground, _last_user_hwnd)
+    desktop_result = await asyncio.to_thread(desktop_control.execute_command, parsed.command, parsed.args)
     if desktop_result is not None:
         return _from_action_result(desktop_result)
 
@@ -1170,7 +1170,7 @@ async def _handle_desktop_action(transcript: str) -> LocalVoiceResult | None:
     try:
         for _ in range(8):  # max 8 rounds
             response = await client.chat.completions.create(
-                model=config.fast_model,
+                model=os.environ.get("KIRA_DESKTOP_MODEL") or config.fast_model,
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
@@ -1712,9 +1712,13 @@ async def speak(text: str) -> None:
             pcm_queue: _queue.Queue = _queue.Queue()
 
             async def _feed() -> None:
-                async for chunk in voice.synthesise_stream(text):
-                    pcm_queue.put(chunk)
-                pcm_queue.put(None)
+                # finally guarantees the sentinel even when synthesis fails —
+                # otherwise play_pcm_stream's feeder blocks on the queue forever
+                try:
+                    async for chunk in voice.synthesise_stream(text):
+                        pcm_queue.put(chunk)
+                finally:
+                    pcm_queue.put(None)
 
             await asyncio.gather(
                 _feed(),

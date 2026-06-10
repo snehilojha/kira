@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 
 from bot import overlay
 from bot import voice as voice_mod
@@ -132,12 +133,18 @@ def play_pcm_stream(pcm_queue: queue.Queue) -> None:
     feeder = threading.Thread(target=_feed_thread, daemon=True)
     feeder.start()
 
-    # Pre-buffer: wait until we have enough data or the stream is exhausted
+    # Pre-buffer: wait until we have enough data or the stream is exhausted.
+    # Deadline guards against a dead feeder (TTS failure upstream) — without
+    # it this loop spins forever inside an executor thread and blocks
+    # interpreter shutdown.
+    _deadline = time.monotonic() + 30.0
     while True:
         with buf_lock:
             ready = len(buf) >= _pre_buffer_bytes or exhausted[0]
         if ready:
             break
+        if time.monotonic() > _deadline:
+            return
         threading.Event().wait(0.01)
 
     # ── amplitude pusher ─────────────────────────────────────────────────────
