@@ -217,17 +217,23 @@ def _build_ptb_app(token: str):
     return app
 
 
+_bot_loop = None  # set by _run_bot; used by main() for graceful shutdown
+
+
 def _run_bot(ptb_app) -> None:
     """Run PTB polling loop on a background thread with its own event loop."""
     import asyncio
+    global _bot_loop
     logger = logging.getLogger(__name__)
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    _bot_loop = loop
     logger.info("Bot is live — polling for updates")
     try:
         ptb_app.run_polling(drop_pending_updates=True)
     finally:
-        loop.close()
+        if not loop.is_closed():
+            loop.close()
 
 
 def main() -> None:
@@ -263,8 +269,21 @@ def main() -> None:
     )
     bot_thread.start()
 
-    # 7. Start Qt overlay on the main thread (Qt requires this)
-    overlay.start_on_main_thread()
+    # 7. Start Qt overlay on the main thread (Qt requires this).
+    # Returns when Qt quits (SIGINT handler in overlay quits it on Ctrl+C).
+    try:
+        overlay.start_on_main_thread()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        logger.info("Shutting down — stopping bot polling")
+        if _bot_loop is not None and _bot_loop.is_running():
+            try:
+                _bot_loop.call_soon_threadsafe(ptb_app.stop_running)
+            except Exception:
+                pass
+        bot_thread.join(timeout=10)
+        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":

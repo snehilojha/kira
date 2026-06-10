@@ -92,7 +92,8 @@ def _value_noise_batch(pts: np.ndarray) -> np.ndarray:
 
 class OrbRenderer(QWidget):
     NUM_DOTS = 2400
-    FPS      = 60
+    FPS      = 30          # paint rate — animation speed is dt-scaled so visuals match 60fps
+    _DT      = 60 / FPS    # animation time-step multiplier
 
     def __init__(self, size: int = 200, parent=None):
         super().__init__(parent)
@@ -126,7 +127,16 @@ class OrbRenderer(QWidget):
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(1000 // self.FPS)
+        # Timer starts on showEvent — a hidden orb costs nothing.
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start(1000 // self.FPS)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._timer.stop()
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -166,7 +176,8 @@ class OrbRenderer(QWidget):
             target = self._target_energy + self._amplitude * 0.28
         elif self._state in ("idle", "hot"):
             # Breathing: slow sine wave so idle/hot never looks frozen
-            breathe = math.sin(self._t * (2 * math.pi / (self.FPS * _BREATHE_PERIOD)))
+            # (_t advances in 60fps-equivalent units regardless of paint FPS)
+            breathe = math.sin(self._t * (2 * math.pi / (60 * _BREATHE_PERIOD)))
             # CPU pressure lifts energy and speeds up breathing slightly
             pressure_lift = self._cpu_pressure * 0.18
             target = self._target_energy + breathe * _BREATHE_AMP + pressure_lift
@@ -179,10 +190,10 @@ class OrbRenderer(QWidget):
             target = self._target_energy + math.sin(self._t * 0.4) * 0.10
         else:
             target = self._target_energy
-        self._energy += (target - self._energy) * 0.10
-        self._amplitude *= 0.82
-        self._t += 1
-        self._rot_y += 0.004 + self._energy * 0.008
+        self._energy += (target - self._energy) * (1 - 0.90 ** self._DT)
+        self._amplitude *= 0.82 ** self._DT
+        self._t += self._DT
+        self._rot_y += (0.004 + self._energy * 0.008) * self._DT
 
         # Slow random drift on rot_x in idle/hot — orb never loops identically
         if self._state in ("idle", "hot") and self._t % 40 == 0:
@@ -252,8 +263,16 @@ class OrbRenderer(QWidget):
         tint_r   = np.clip(tr  + (shell * 40).astype(np.int32), 0, 255)
         tint_b   = np.clip(tb  + (shell * 25).astype(np.int32), 0, 255)
 
-        # ── Sort back-to-front by rz
-        order = np.argsort((rz + 1.0) * 0.5)
+        # ── Cull invisible dots before the Python draw loop, then sort back-to-front
+        visible = alpha_arr >= 0.03
+        order = np.argsort(rz[visible])
+        xs    = sx_arr[visible][order].tolist()
+        ys    = sy_arr[visible][order].tolist()
+        sizes = size_arr[visible][order].tolist()
+        alphas = alpha_arr[visible][order].tolist()
+        rs    = tint_r[visible][order].tolist()
+        gs    = bright_w[visible][order].tolist()
+        bs    = tint_b[visible][order].tolist()
 
         # ── Outer aura (tinted glow)
         tr, tg, tb = self._tint
@@ -270,25 +289,15 @@ class OrbRenderer(QWidget):
 
         # ── Draw dots
         painter.setPen(Qt.PenStyle.NoPen)
-        for i in order:
-            a = float(alpha_arr[i])
-            if a < 0.03:
-                continue
-            sx_i = float(sx_arr[i])
-            sy_i = float(sy_arr[i])
-            s    = float(size_arr[i])
-            rv   = int(tint_r[i])
-            gv   = int(bright_w[i])
-            bv   = int(tint_b[i])
-
+        for sx_i, sy_i, s, a, rv, gv, bv in zip(xs, ys, sizes, alphas, rs, gs, bs):
             # Glow halo on bright edge dots
             if a > 0.40 and s > 0.6:
                 gr = s * 3.2
-                painter.setBrush(QColor(rv, gv, bv, max(0, int(a * 22))))
+                painter.setBrush(QColor(rv, gv, bv, int(a * 22)))
                 painter.drawEllipse(int(sx_i - gr), int(sy_i - gr),
                                     max(1, int(gr * 2)), max(1, int(gr * 2)))
 
-            painter.setBrush(QColor(rv, gv, bv, max(0, int(a * 255))))
+            painter.setBrush(QColor(rv, gv, bv, int(a * 255)))
             r2 = max(0.5, s)
             painter.drawEllipse(int(sx_i - r2), int(sy_i - r2),
                                 max(1, int(r2 * 2)), max(1, int(r2 * 2)))

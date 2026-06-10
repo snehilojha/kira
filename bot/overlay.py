@@ -165,17 +165,26 @@ class _LeftPanel(QWidget):
 
         self._start = time.monotonic()
 
-        # Clock ticks every second
+        # Clock ticks every second — runs only while the panel is visible
         self._clock_timer = QTimer(self)
         self._clock_timer.timeout.connect(self._tick_clock)
-        self._clock_timer.start(1000)
-        self._tick_clock()
 
-        # System stats refresh every 3 s — fetch on background thread
+        # System stats refresh every 3 s — fetch on background thread,
+        # only while the panel is visible (full mode)
         self._sys_timer = QTimer(self)
         self._sys_timer.timeout.connect(self._refresh_sys)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._tick_clock()
+        self._clock_timer.start(1000)
         self._sys_timer.start(3000)
         threading.Thread(target=self._fetch_and_set_sys, daemon=True).start()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._clock_timer.stop()
+        self._sys_timer.stop()
 
     def _tick_clock(self) -> None:
         import datetime
@@ -377,11 +386,22 @@ class _RightPanel(QWidget):
         kira_card.body().addWidget(self._action)
         v.addWidget(kira_card, stretch=1)
 
-        # Fetch weather once immediately on a thread, then refresh every 10 min
-        self._refresh_weather()
+        # Weather refreshes every 10 min — only while the panel is visible.
+        # First fetch happens on showEvent.
         self._wx_timer = QTimer(self)
         self._wx_timer.timeout.connect(self._refresh_weather)
+        self._wx_fetched = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._wx_fetched:
+            self._wx_fetched = True
+            self._refresh_weather()
         self._wx_timer.start(10 * 60 * 1000)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._wx_timer.stop()
 
     def set_market_data(self, snapshot) -> None:
         """Update markets strip from a MarketSnapshot object."""
@@ -496,7 +516,16 @@ class _CompactDot(QWidget):
         self._t     = 0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
-        self._timer.start(50)  # 20fps is plenty for a dot
+        # Timer runs only while visible (started in showEvent)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._timer.isActive():
+            self._timer.start(50)  # 20fps is plenty for a dot
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self._timer.stop()
 
     def set_state(self, state: str) -> None:
         self._hue = {
@@ -507,10 +536,13 @@ class _CompactDot(QWidget):
             "autonomous": 220,
         }.get(state, 270)
         self._pulse = 1.0 if state in ("listening", "speaking") else 0.0
+        self.update()  # repaint once for the new colour even when not pulsing
 
     def _tick(self) -> None:
         self._t += 1
-        self.update()
+        # Static frame when not pulsing — no point repainting 20x/sec
+        if self._pulse:
+            self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -590,11 +622,10 @@ class _KiraOverlay(QWidget):
         # Global hotkey registered via keyboard package (works even when Qt has no focus)
         _register_global_hotkey(self)
 
-        # Market data — fetch immediately then every 5 min
+        # Market data — fetched every 5 min, but only while full mode is up
+        # (the markets card is invisible otherwise). Started in _set_full_mode.
         self._market_timer = QTimer(self)
         self._market_timer.timeout.connect(self._refresh_market_data)
-        self._market_timer.start(5 * 60 * 1000)
-        self._refresh_market_data()
 
         self._apply_compact_geometry()
         self.hide()
@@ -677,9 +708,12 @@ class _KiraOverlay(QWidget):
             self._mode_label.show()
             self._visible = True
             self.show()
+            self._refresh_market_data()
+            self._market_timer.start(5 * 60 * 1000)
             self._fade_to(1.0)
         else:
             self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._market_timer.stop()
             self._orb_full.hide()
             self._left.hide()
             self._right.hide()
@@ -804,6 +838,17 @@ def _qt_main() -> None:
     _app = QApplication.instance() or QApplication(sys.argv)
     _app.setQuitOnLastWindowClosed(False)
     _window = _KiraOverlay()
+
+    # Ctrl+C: Qt's C event loop blocks Python signal delivery, so wake the
+    # interpreter periodically and quit Qt cleanly on SIGINT. Without this,
+    # KeyboardInterrupt lands at a random spot in widget timer code (or never).
+    if threading.current_thread() is threading.main_thread():
+        import signal
+        signal.signal(signal.SIGINT, lambda *_: _app.quit())
+        _window._sigint_wake = QTimer()
+        _window._sigint_wake.timeout.connect(lambda: None)
+        _window._sigint_wake.start(500)
+
     _app.exec()
 
 
