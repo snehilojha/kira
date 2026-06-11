@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import re
-import subprocess
+import subprocess  # noqa: F401 — re-exported so tests can patch handlers.subprocess.Popen
 from pathlib import Path
 
 import psutil
@@ -208,7 +208,7 @@ def _format_system_snapshot() -> str:
         if temperatures:
             lines.append(f"GPU temp: {max(temperatures):.1f}°C")
     except Exception:
-        pass
+        logger.debug("GPU temperature unavailable", exc_info=True)
 
     return " | ".join(lines)
 
@@ -268,7 +268,7 @@ async def _build_ask_system_prompt() -> str:
     try:
         observer_context = observer.get_current_context()
     except Exception:
-        pass
+        logger.warning("Observer context unavailable for /ask prompt", exc_info=True)
 
     session_context = ""
     try:
@@ -276,7 +276,7 @@ async def _build_ask_system_prompt() -> str:
 
         session_context = await memory.get_recent_sessions(3)
     except Exception:
-        pass
+        logger.warning("Recent sessions unavailable for /ask prompt", exc_info=True)
 
     world_context = ""
     try:
@@ -298,7 +298,7 @@ async def _build_ask_system_prompt() -> str:
                     parts.append("Markets: " + ", ".join(f"{k}: {v}" for k, v in indices.items()))
             world_context = "\n".join(parts)
     except Exception:
-        pass
+        logger.warning("World snapshot unavailable for /ask prompt", exc_info=True)
 
     sections = [
         "You are a command translator for a Telegram bot called Kira.",
@@ -391,6 +391,7 @@ def _decode_ask_cb(data: str) -> tuple[str, list[str]]:
             args = []
         return command, [str(a) for a in args]
     except Exception:
+        logger.warning("Malformed /ask callback data: %r", data, exc_info=True)
         return "", []
 
 
@@ -661,7 +662,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if alert_ctx:
                 user_message = f"[Replying to alert: {alert_ctx}]\n{user_message}"
         except Exception:
-            pass
+            logger.debug("Failed to attach escalation context to reply", exc_info=True)
 
     try:
         await db.log_conversation("user", user_message)
@@ -681,7 +682,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             await db.log_conversation("assistant", result.summary)
         except Exception:
-            pass
+            logger.debug("Failed to log assistant reply to DB", exc_info=True)
         await update.message.reply_text(result.summary[:4000])
     except Exception as exc:
         logger.error("handle_message error: %s", exc, exc_info=True)

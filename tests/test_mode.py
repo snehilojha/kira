@@ -111,14 +111,12 @@ class TestPresenceDetection(unittest.TestCase):
 
     def test_below_threshold_maps_to_active_session(self) -> None:
         with patch.object(mode_module, "_get_last_input_seconds", return_value=60.0):
-            with patch.object(mode_module, "_IDLE_THRESHOLD_SECONDS", 180.0):
-                self._run(mode_module._tick())
+            self._run(mode_module._tick(idle_threshold=180.0))
         self.assertEqual(get_mode(), "active_session")
 
     def test_above_threshold_maps_to_autonomous(self) -> None:
         with patch.object(mode_module, "_get_last_input_seconds", return_value=300.0):
-            with patch.object(mode_module, "_IDLE_THRESHOLD_SECONDS", 180.0):
-                self._run(mode_module._tick())
+            self._run(mode_module._tick(idle_threshold=180.0))
         self.assertEqual(get_mode(), "autonomous")
 
     def test_get_last_input_seconds_fallback_on_error(self) -> None:
@@ -131,8 +129,7 @@ class TestPresenceDetection(unittest.TestCase):
         """Tick must not overwrite awaiting_confirmation with active_session."""
         self._run(set_mode("awaiting_confirmation", "manual"))
         with patch.object(mode_module, "_get_last_input_seconds", return_value=10.0):
-            with patch.object(mode_module, "_IDLE_THRESHOLD_SECONDS", 180.0):
-                self._run(mode_module._tick())
+            self._run(mode_module._tick(idle_threshold=180.0))
         self.assertEqual(get_mode(), "awaiting_confirmation")
 
 

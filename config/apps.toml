@@ -21,3 +21,11 @@ aliases = ["relax mode", "chill mode","fun time"]
 open = ["chrome"]
 close = ["vscode", "claude"]
 say = "Good work, sir. Have a nice day."
+
+# Intents map natural-language phrases straight to a Kira command, taking
+# priority over the generic "open <app>" handling. Uncomment to enable:
+#
+# [intents.open_browser]
+# aliases = ["open browser", "browser please", "fire up the browser"]
+# command = "/open"
+# args = ["chrome"]
