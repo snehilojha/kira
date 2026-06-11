@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,15 @@ async def init_db(db_path: Path | str | None = None) -> None:
     if resolved != ":memory:":
         _db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Close any previous connection — its worker thread is non-daemon and
+    # would otherwise keep the interpreter alive at shutdown.
+    if _conn is not None:
+        try:
+            await _conn.close()
+        except Exception:
+            pass
+        _conn = None
+
     _conn = await aiosqlite.connect(resolved)
     _conn.row_factory = aiosqlite.Row
 
@@ -67,8 +77,10 @@ async def init_db(db_path: Path | str | None = None) -> None:
         try:
             await _conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typedef}")
             await _conn.commit()
-        except Exception:
-            pass  # column already exists
+        except sqlite3.OperationalError:
+            # Expected when the column already exists; a genuine schema problem
+            # (e.g. missing table) still surfaces in the log instead of vanishing.
+            logger.debug("Column %s.%s already present; skipping ALTER", table, col)
 
     logger.info("Database initialised at %s", resolved)
 

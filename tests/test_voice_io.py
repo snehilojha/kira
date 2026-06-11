@@ -33,20 +33,22 @@ class VoiceIOTests(unittest.TestCase):
         self.assertEqual(wav_text, "open chrome")
 
     def test_synthesise_accepts_response_format(self) -> None:
-        async def _run() -> bytes:
+        async def _run() -> tuple[bytes, str]:
             response = types.SimpleNamespace(read=lambda: b"wav-bytes")
             with patch.object(
                 voice.provider,
                 "synthesise_speech",
                 new=AsyncMock(return_value=response),
             ) as synth_mock:
-                audio = await voice.synthesise("hello", response_format="wav")
+                audio, fmt = await voice.synthesise("hello", response_format="wav")
 
             synth_mock.assert_awaited_once()
             self.assertEqual(synth_mock.await_args.kwargs["response_format"], "wav")
-            return audio
+            return audio, fmt
 
-        self.assertEqual(asyncio.run(_run()), b"wav-bytes")
+        audio, fmt = asyncio.run(_run())
+        self.assertEqual(audio, b"wav-bytes")
+        self.assertEqual(fmt, "wav")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from bot import notifier
 from bot import overlay
 from bot import ui_mode
 from bot import scheduler
+from bot import supervision
 from bot import task_state
 from bot import watchdog
 from bot import world
@@ -122,15 +123,25 @@ def _build_ptb_app(token: str):
                 f"Marked {len(interrupted)} task(s) as interrupted; no actions were replayed. "
                 "Use /tasks to inspect them."
             )
-        application.create_task(monitor.start_monitor())
-        application.create_task(memory.start_daily_summariser())
-        application.create_task(observer.start())
-        application.create_task(observer.start_fast_loop())
-        application.create_task(job_monitor.start())
-        application.create_task(mode.start())
-        application.create_task(world.start())
-        application.create_task(local_voice.start_as_task())
-        application.create_task(reflector.start_weekly_reflector())
+        # Each long-running loop is wrapped by the supervisor so an unhandled
+        # exception is logged, alerted over Telegram, and restarted with
+        # backoff instead of silently killing the feature.
+        supervised = [
+            ("monitor", monitor.start_monitor),
+            ("memory-summariser", memory.start_daily_summariser),
+            ("observer", observer.start),
+            ("observer-fast", observer.start_fast_loop),
+            ("job-monitor", job_monitor.start),
+            ("mode", mode.start),
+            ("world", world.start),
+            ("local-voice", local_voice.start_as_task),
+            ("reflector", reflector.start_weekly_reflector),
+        ]
+        for task_name, factory in supervised:
+            application.create_task(
+                supervision.supervise(factory, name=task_name),
+                name=f"kira-{task_name}",
+            )
         presence.start(local_voice.speak)
 
     app = ApplicationBuilder().token(token).post_init(_post_init).build()

@@ -26,6 +26,7 @@ openwakeword
 pyautogui
 pywin32
 ddgs
+watchdog
 # Presence detection (optional — only if KIRA_PRESENCE_ENABLED=true):
 # insightface
 # Local package — install manually:
